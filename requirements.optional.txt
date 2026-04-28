@@ -1,0 +1,5 @@
+# Optional dependencies for advanced analysis modules
+# Install when you want YOLO-based ball speed refinement:
+# pip install -r requirements.optional.txt
+
+ultralytics==8.2.0
