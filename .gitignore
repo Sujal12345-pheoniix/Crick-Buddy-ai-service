@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+.env.*
+!.env.example
+.env
+.env.local
+.env.*
+__pycache__/
+*.pyc
+*.pyd
+*.pt
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Large model files (IMPORTANT)
+*.pt
+*.pth
+*.onnx
+
+# Temp files
+temp/
+uploads/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Environment variables
+.env

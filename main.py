@@ -14,6 +14,10 @@ app = FastAPI(
     version="1.0.0"
 )
 
+@app.get("/")
+def root():
+    return {"message": "AI Service Running 🚀"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
