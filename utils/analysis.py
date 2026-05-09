@@ -148,42 +148,42 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
 def is_cricket_content(image: np.ndarray) -> bool:
     """
     Validate if the image/frame contains cricket-related content.
-    Checks for a person and optionally a bat/ball using a lightweight detector.
+    Checks for a person and cricket-related objects (bat, ball) using YOLO.
     """
     try:
         from ultralytics import YOLO
         
-        # Cache the model to avoid reloading
         if not hasattr(is_cricket_content, "_model"):
-            # Load nano model for speed
             is_cricket_content._model = YOLO("yolov8n.pt")
         
         results = is_cricket_content._model(image, verbose=False)
         
         found_person = False
-        found_sports_item = False # bat, ball, etc.
+        found_cricket_item = False 
         
+        # COCO classes: 0: person, 32: sports ball, 34: baseball bat
         for result in results:
             for box in result.boxes:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
                 
-                if conf < 0.25: # Lowered threshold slightly for better recall
+                if conf < 0.35: 
                     continue
                 
-                if cls_id == 0: # person
+                if cls_id == 0: 
                     found_person = True
-                if cls_id in [32, 34, 38]: # sports ball, baseball bat (cricket), tennis racket
-                    found_sports_item = True
+                if cls_id in [32, 34]: # ball or bat
+                    found_cricket_item = True
         
-        # A very basic heuristic: 
-        # If we find a person AND they are in a sports-like context (found item) 
-        # OR if we find a person and they are large enough in the frame.
-        # To be strict as requested:
-        return found_person
+        # For cricket buddy, we want to be reasonably sure.
+        # However, sometimes YOLO misses the bat/ball in a single frame.
+        # So we might want to check if it's a person in a specific stance, 
+        # but for now, finding a person + any sports item is a good start.
+        # If we want to be VERY strict as requested:
+        return found_person and found_cricket_item
     except Exception as e:
         print(f"Cricket validation error: {e}")
-        return True # Fallback to avoid blocking valid users if detector fails
+        return True # Fallback to avoid blocking valid users
 
 
 def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[dict]]:
@@ -192,9 +192,16 @@ def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[di
         import mediapipe as mp
         import cv2
         
-        # Optional: Check first frame for cricket content if not already checked
-        if frames and not is_cricket_content(frames[0]):
-            return []
+        # Check multiple frames for cricket content to be more accurate
+        # If none of the sample frames look like cricket, reject
+        cricket_confidence = 0
+        samples = [frames[0], frames[len(frames)//2], frames[-1]]
+        for img in samples:
+            if is_cricket_content(img):
+                cricket_confidence += 1
+        
+        if cricket_confidence == 0:
+            return [] # Empty list indicates validation failed
 
         mp_pose = mp.solutions.pose
         all_landmarks = []
@@ -348,21 +355,30 @@ async def generate_report(metrics: dict, type_: str) -> dict:
 
     client = genai.Client(api_key=api_key)
 
-    prompt = f"""You are a professional cricket coach. Analyze these player metrics and provide an expert report.
-Analysis Type: {type_.capitalize()}
-Metrics (from pose / motion analysis): {json.dumps(metrics, default=str)}
+    prompt = f"""You are a world-class professional cricket coach and biomechanics expert. 
+Analyze these player metrics extracted from pose estimation and provide a deep, accurate technical report.
 
-Respond in JSON ONLY with this shape:
+Analysis Type: {type_.capitalize()}
+Detailed Metrics: {json.dumps(metrics, default=str)}
+
+Focus on:
+1. Identifying subtle technical flaws in {type_} technique.
+2. Providing actionable, elite-level coaching cues.
+3. Suggesting drills that directly address the numeric deviations in the metrics.
+
+Respond in JSON ONLY with this exact structure:
 {{
-  "strengths": ["2-4 items"],
-  "weaknesses": ["1-3 items"],
-  "mistakes": ["2-4 likely technical errors given these numbers"],
-  "improvement_suggestions": ["4-6 specific tactical tips for the next week"],
-  "training_drills": ["3-5 drills with sets/reps"],
-  "recommendations": ["2-4 gear, recovery, or strategy notes"],
-  "best_practices": ["3-5 habits"]
+  "strengths": ["3-5 high-quality technical strengths"],
+  "weaknesses": ["2-4 specific technical areas for improvement"],
+  "mistakes": ["Detailed explanation of 3-4 likely technical mistakes based on the metrics"],
+  "improvement_suggestions": ["5-7 specific technical and tactical tips for immediate improvement"],
+  "training_drills": ["4-6 high-intensity drills with specific sets, reps, and focus points"],
+  "recommendations": ["3-5 personalized notes on equipment, physical conditioning, or match strategy"],
+  "best_practices": ["4-6 professional habits for elite performance"]
 }}
-Be specific to the numeric metrics. Use clear cricket coaching language. Do not invent exact biomechanical measurements that are not in the metrics."""
+
+Use professional cricket terminology (e.g., 'falling over the off-side', 'closed face', 'unstable base', 'loading phase'). 
+Ensure the feedback feels personalized to the numbers provided. Do not use generic advice."""
 
     try:
         response = await client.aio.models.generate_content(
