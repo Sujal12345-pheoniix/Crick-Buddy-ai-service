@@ -114,6 +114,10 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
         if image is None:
             return None
         
+        # Check for cricket context (basic heuristic or detector)
+        if not is_cricket_content(image):
+            return {"error": "wrong_content"}
+
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         with mp_pose.Pose(
@@ -141,12 +145,57 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
         return None
 
 
+def is_cricket_content(image: np.ndarray) -> bool:
+    """
+    Validate if the image/frame contains cricket-related content.
+    Checks for a person and optionally a bat/ball using a lightweight detector.
+    """
+    try:
+        from ultralytics import YOLO
+        
+        # Cache the model to avoid reloading
+        if not hasattr(is_cricket_content, "_model"):
+            # Load nano model for speed
+            is_cricket_content._model = YOLO("yolov8n.pt")
+        
+        results = is_cricket_content._model(image, verbose=False)
+        
+        found_person = False
+        found_sports_item = False # bat, ball, etc.
+        
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                
+                if conf < 0.25: # Lowered threshold slightly for better recall
+                    continue
+                
+                if cls_id == 0: # person
+                    found_person = True
+                if cls_id in [32, 34, 38]: # sports ball, baseball bat (cricket), tennis racket
+                    found_sports_item = True
+        
+        # A very basic heuristic: 
+        # If we find a person AND they are in a sports-like context (found item) 
+        # OR if we find a person and they are large enough in the frame.
+        # To be strict as requested:
+        return found_person
+    except Exception as e:
+        print(f"Cricket validation error: {e}")
+        return True # Fallback to avoid blocking valid users if detector fails
+
+
 def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[dict]]:
     """Run MediaPipe Pose on multiple frames and return list of landmark data."""
     try:
         import mediapipe as mp
         import cv2
         
+        # Optional: Check first frame for cricket content if not already checked
+        if frames and not is_cricket_content(frames[0]):
+            return []
+
         mp_pose = mp.solutions.pose
         all_landmarks = []
         

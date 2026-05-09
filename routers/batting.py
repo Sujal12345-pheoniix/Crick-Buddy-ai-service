@@ -15,6 +15,7 @@ from typing import Optional
 from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames, analyze_pose_from_image,
     calculate_angle, score_angle, generate_report, clamp_score,
+    is_cricket_content,
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_WRIST, RIGHT_WRIST, LEFT_HIP, RIGHT_HIP,
     LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE,
@@ -157,6 +158,13 @@ async def analyze_batting(
         frames = extract_frames(tmp_path, num_frames=30)
 
         if frames:
+            # Validate if it's cricket content
+            if not is_cricket_content(frames[0]):
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Wrong video uploaded. Please upload a cricket-related batting or bowling video."
+                )
+
             all_landmarks = analyze_pose_from_video_frames(frames)
             valid = [lm for lm in all_landmarks if lm is not None]
 
@@ -169,7 +177,7 @@ async def analyze_batting(
                 # Shot classification
                 batting_metrics['shotType'] = classify_shot(valid)
             else:
-                raise HTTPException(status_code=400, detail="Invalid video: Please upload a cricket batting or bowling video (no human detected).")
+                raise HTTPException(status_code=400, detail="No human detected in the video. Please ensure the player is clearly visible.")
         else:
             raise HTTPException(status_code=400, detail="Invalid video: Could not extract frames.")
 

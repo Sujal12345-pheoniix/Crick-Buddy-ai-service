@@ -14,6 +14,7 @@ from typing import Optional
 from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames,
     calculate_angle, score_angle, generate_report, estimate_ball_speed, clamp_score,
+    is_cricket_content,
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_WRIST, RIGHT_WRIST, LEFT_HIP, RIGHT_HIP,
     LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE,
@@ -116,6 +117,13 @@ async def analyze_bowling(
         frames = extract_frames(tmp_path, num_frames=30)
 
         if frames:
+            # Validate if it's cricket content
+            if not is_cricket_content(frames[0]):
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Wrong video uploaded. Please upload a cricket-related bowling video."
+                )
+
             # Ball speed estimation
             ball_speed = estimate_ball_speed(frames)
             if ball_speed is None:
@@ -132,7 +140,7 @@ async def analyze_bowling(
                 bowling_metrics.update(pose_metrics)
                 landmarks_data = mid_lm
             else:
-                raise HTTPException(status_code=400, detail="Invalid video: Please upload a cricket batting or bowling video (no human detected).")
+                raise HTTPException(status_code=400, detail="No human detected in the video. Please ensure the player is clearly visible.")
 
             # Classify bowling style
             arm_angle = bowling_metrics.get('armRotationAngle', 160)

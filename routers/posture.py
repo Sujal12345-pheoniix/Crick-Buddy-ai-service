@@ -13,6 +13,7 @@ from typing import Optional
 from utils.analysis import (
     analyze_pose_from_image, analyze_pose_from_video_frames, extract_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
+    is_cricket_content,
     LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE,
     LEFT_ANKLE, RIGHT_ANKLE, get_point
@@ -91,10 +92,23 @@ async def analyze_posture(
         # First try MediaPipe image inference.
         landmarks = analyze_pose_from_image(tmp_path)
 
+        if isinstance(landmarks, dict) and landmarks.get("error") == "wrong_content":
+            raise HTTPException(
+                status_code=400, 
+                detail="Wrong image/video uploaded. Please upload a cricket-related posture image or video."
+            )
+
         # If upload is a video, analyze sampled frames and take a stable middle detection.
         if not landmarks:
             frames = extract_frames(tmp_path, num_frames=24)
             if frames:
+                # Check first frame for cricket content
+                if not is_cricket_content(frames[0]):
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="Wrong video uploaded. Please upload a cricket-related video."
+                    )
+                
                 sequence_landmarks = analyze_pose_from_video_frames(frames)
                 valid = [lm for lm in sequence_landmarks if lm is not None]
                 if valid:
@@ -104,7 +118,7 @@ async def analyze_posture(
             posture_metrics = analyze_posture_landmarks(landmarks)
             landmarks_data = landmarks
         else:
-            raise HTTPException(status_code=400, detail="Invalid image: Not a cricket posture (no human detected).")
+            raise HTTPException(status_code=400, detail="No human detected in the image. Please ensure the player is clearly visible.")
 
         # Overall posture score
         scores = [
