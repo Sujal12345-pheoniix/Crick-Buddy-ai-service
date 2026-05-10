@@ -5,6 +5,8 @@ numpy<2.0.0
 opencv-python-headless>=4.9.0.80
 mediapipe>=0.10.30
 ultralytics>=8.2.0
+torch>=2.2.0
+torchvision>=0.17.0
 pillow>=10.2.0
 google-genai>=0.1.0
 python-dotenv>=1.0.0
