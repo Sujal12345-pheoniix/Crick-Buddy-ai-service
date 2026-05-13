@@ -72,7 +72,7 @@ def analyze_posture_landmarks(landmarks: dict) -> dict:
     return metrics
 
 
-import requests
+import httpx
 
 @router.post("/posture")
 async def analyze_posture(
@@ -96,12 +96,13 @@ async def analyze_posture(
             content = await file.read()
             tmp.write(content)
         elif fileUrl:
-            response = requests.get(fileUrl, stream=True)
-            if response.status_code == 200:
-                for chunk in response.iter_content(1024 * 1024):
-                    tmp.write(chunk)
-            else:
-                raise HTTPException(status_code=400, detail="Failed to download file from URL")
+            async with httpx.AsyncClient() as client:
+                async with client.stream("GET", fileUrl) as response:
+                    if response.status_code == 200:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                            tmp.write(chunk)
+                    else:
+                        raise HTTPException(status_code=400, detail="Failed to download file from URL")
         tmp_path = tmp.name
 
     try:
