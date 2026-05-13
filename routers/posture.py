@@ -96,7 +96,7 @@ async def analyze_posture(
             content = await file.read()
             tmp.write(content)
         elif fileUrl:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream("GET", fileUrl) as response:
                     if response.status_code == 200:
                         async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
