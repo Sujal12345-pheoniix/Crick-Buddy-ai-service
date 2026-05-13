@@ -108,8 +108,7 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
     try:
         import cv2
         import mediapipe as mp
-        
-        mp_pose = mp.solutions.pose
+        from mediapipe.python.solutions import pose as mp_pose
         image = cv2.imread(image_path)
         if image is None:
             return None
@@ -203,7 +202,7 @@ def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[di
         if cricket_confidence == 0:
             return [] # Empty list indicates validation failed
 
-        mp_pose = mp.solutions.pose
+        from mediapipe.python.solutions import pose as mp_pose
         all_landmarks = []
         
         with mp_pose.Pose(

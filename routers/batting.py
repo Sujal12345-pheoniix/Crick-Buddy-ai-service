@@ -22,67 +22,7 @@ from utils.analysis import (
     get_point
 )
 
-from core.analyzer import CricketAnalyzer
-from core.validator import ContentValidator
-
 router = APIRouter()
-analyzer = CricketAnalyzer()
-validator = ContentValidator()
-
-@router.post("/batting")
-async def analyze_batting(
-    file: UploadFile = File(...),
-    upload_id: Optional[str] = Form(None)
-):
-    """Analyze batting video using real sequence analysis."""
-    suffix = os.path.splitext(file.filename)[1] if file.filename else '.mp4'
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
-    try:
-        # Step 1: Video Validation
-        is_valid, error_msg = validator.validate_video(tmp_path, 'batting')
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
-
-        # Step 2-5: Frame Extraction, Pose, Detection, Feature Extraction
-        sequence = analyzer.extract_landmarks_sequence(tmp_path)
-        if not sequence or len([s for s in sequence if s]) < 5:
-            raise HTTPException(status_code=400, detail="Could not detect player in video sequence.")
-
-        # Step 6-8: Temporal Analysis & Scoring Engine
-        analysis_results = analyzer.analyze_batting_sequence(sequence)
-        if "error" in analysis_results:
-            raise HTTPException(status_code=400, detail=analysis_results["error"])
-
-        # Step 9: AI Report Generation (Gemini fallback)
-        report = await generate_report(analysis_results["scores"], 'batting')
-
-        return {
-            "success": True,
-            "type": "batting",
-            "upload_id": upload_id,
-            "batting_metrics": {
-                "stanceScore": analysis_results["scores"]["balance"],
-                "batSwingAngle": 45.0, # Placeholder for specific frame metric
-                "headPosition": analysis_results["faults"][0] if analysis_results["faults"] else "Stable head position",
-                "headPositionScore": analysis_results["scores"]["head_stability"],
-                "timingScore": analysis_results["scores"]["timing"],
-                "followThroughScore": 80,
-                "shotType": "Straight Drive",
-                "overallBattingScore": analysis_results["scores"]["overall"]
-            },
-            "overall_score": analysis_results["scores"]["overall"],
-            "landmarks": sequence[len(sequence)//2],
-            **analysis_results,
-            **report
-        }
-
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
 
 SHOT_TYPES = ["Cover Drive", "Pull Shot", "Cut Shot", "Sweep", "Straight Drive", "Flick"]
 
