@@ -72,17 +72,36 @@ def analyze_posture_landmarks(landmarks: dict) -> dict:
     return metrics
 
 
+import requests
+
 @router.post("/posture")
 async def analyze_posture(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    fileUrl: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None)
 ):
     """Analyze body posture from image using MediaPipe Pose."""
+    if not file and not fileUrl:
+        raise HTTPException(status_code=400, detail="No file or fileUrl provided")
 
-    suffix = os.path.splitext(file.filename)[1] if file.filename else '.jpg'
+    suffix = '.jpg'
+    if file and file.filename:
+        suffix = os.path.splitext(file.filename)[1]
+    elif fileUrl:
+        if fileUrl.endswith('.mp4') or fileUrl.endswith('.mov'):
+            suffix = '.mp4'
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
+        if file:
+            content = await file.read()
+            tmp.write(content)
+        elif fileUrl:
+            response = requests.get(fileUrl, stream=True)
+            if response.status_code == 200:
+                for chunk in response.iter_content(1024 * 1024):
+                    tmp.write(chunk)
+            else:
+                raise HTTPException(status_code=400, detail="Failed to download file from URL")
         tmp_path = tmp.name
 
     try:
@@ -95,7 +114,7 @@ async def analyze_posture(
         if isinstance(landmarks, dict) and landmarks.get("error") == "wrong_content":
             raise HTTPException(
                 status_code=400, 
-                detail="Wrong image/video uploaded. Please upload a cricket-related posture image or video."
+                detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
             )
 
         # If upload is a video, analyze sampled frames and take a stable middle detection.
@@ -106,7 +125,7 @@ async def analyze_posture(
                 if not is_cricket_content(frames[0]):
                     raise HTTPException(
                         status_code=400, 
-                        detail="Wrong video uploaded. Please upload a cricket-related video."
+                        detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
                     )
                 
                 sequence_landmarks = analyze_pose_from_video_frames(frames)

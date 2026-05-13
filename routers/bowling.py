@@ -97,17 +97,35 @@ def analyze_bowling_landmarks(landmarks: dict) -> dict:
     return metrics
 
 
+import requests
+
 @router.post("/bowling")
 async def analyze_bowling(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    fileUrl: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None)
 ):
     """Analyze bowling video using MediaPipe + OpenCV ball speed estimation."""
+    if not file and not fileUrl:
+        raise HTTPException(status_code=400, detail="No file or fileUrl provided")
 
-    suffix = os.path.splitext(file.filename)[1] if file.filename else '.mp4'
+    suffix = '.mp4'
+    if file and file.filename:
+        suffix = os.path.splitext(file.filename)[1]
+    elif fileUrl and (fileUrl.endswith('.mp4') or fileUrl.endswith('.mov')):
+        suffix = '.mp4'
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
+        if file:
+            content = await file.read()
+            tmp.write(content)
+        elif fileUrl:
+            response = requests.get(fileUrl, stream=True)
+            if response.status_code == 200:
+                for chunk in response.iter_content(1024 * 1024):
+                    tmp.write(chunk)
+            else:
+                raise HTTPException(status_code=400, detail="Failed to download file from URL")
         tmp_path = tmp.name
 
     try:
@@ -121,7 +139,7 @@ async def analyze_bowling(
             if not is_cricket_content(frames[0]):
                 raise HTTPException(
                     status_code=400, 
-                    detail="Wrong video uploaded. Please upload a cricket-related bowling video."
+                    detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
                 )
 
             # Ball speed estimation
