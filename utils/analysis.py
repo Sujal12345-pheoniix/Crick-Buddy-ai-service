@@ -108,7 +108,6 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
     try:
         import cv2
         import mediapipe as mp
-        from mediapipe.python.solutions import pose as mp_pose
         image = cv2.imread(image_path)
         if image is None:
             return None
@@ -119,11 +118,11 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        with mp_pose.Pose(
+        with mp.solutions.pose.Pose(
             static_image_mode=True,
-            model_complexity=2,
+            model_complexity=1,
             enable_segmentation=False,
-            min_detection_confidence=0.5
+            min_detection_confidence=0.4
         ) as pose:
             results = pose.process(image_rgb)
             
@@ -147,13 +146,15 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
 def is_cricket_content(image: np.ndarray) -> bool:
     """
     Validate if the image/frame contains cricket-related content.
-    Checks for a person and cricket-related objects (bat, ball) using YOLO.
+    Requires at least a person detected (cricket bat/ball detection is bonus).
+    Returns True = likely cricket, False = clearly non-cricket.
     """
     try:
         from ultralytics import YOLO
         
         if not hasattr(is_cricket_content, "_model"):
-            is_cricket_content._model = YOLO("yolov8n.pt")
+            yolo_path = os.getenv("YOLO_WEIGHTS_PATH", "yolov8n.pt")
+            is_cricket_content._model = YOLO(yolo_path)
         
         results = is_cricket_content._model(image, verbose=False)
         
@@ -166,23 +167,27 @@ def is_cricket_content(image: np.ndarray) -> bool:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
                 
-                if conf < 0.35: 
+                if conf < 0.25:  # Lower threshold to catch more cases
                     continue
                 
                 if cls_id == 0: 
                     found_person = True
-                if cls_id in [32, 34]: # ball or bat
+                if cls_id in [32, 34]:  # sports ball or baseball bat (close to cricket bat)
                     found_cricket_item = True
         
-        # For cricket buddy, we want to be reasonably sure.
-        # However, sometimes YOLO misses the bat/ball in a single frame.
-        # So we might want to check if it's a person in a specific stance, 
-        # but for now, finding a person + any sports item is a good start.
-        # If we want to be VERY strict as requested:
-        return found_person and found_cricket_item
+        # Primary requirement: must have a person in frame.
+        # If a person is found + bat/ball detected → definitely cricket.
+        # If only person found → likely cricket (YOLO often misses cricket-specific gear).
+        # If NO person → reject.
+        if not found_person:
+            return False
+        
+        # If we detect a sports ball or bat with a person, that's very strong signal.
+        # If only a person, still allow (cricket bats are often classified as other objects).
+        return True
     except Exception as e:
         print(f"Cricket validation error: {e}")
-        return True # Fallback to avoid blocking valid users
+        return True  # Fallback: do not block valid users due to model errors
 
 
 def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[dict]]:
@@ -191,25 +196,13 @@ def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[di
         import mediapipe as mp
         import cv2
         
-        # Check multiple frames for cricket content to be more accurate
-        # If none of the sample frames look like cricket, reject
-        cricket_confidence = 0
-        samples = [frames[0], frames[len(frames)//2], frames[-1]]
-        for img in samples:
-            if is_cricket_content(img):
-                cricket_confidence += 1
-        
-        if cricket_confidence == 0:
-            return [] # Empty list indicates validation failed
-
-        from mediapipe.python.solutions import pose as mp_pose
         all_landmarks = []
         
-        with mp_pose.Pose(
+        with mp.solutions.pose.Pose(
             static_image_mode=False,
             model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4
         ) as pose:
             for frame in frames:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

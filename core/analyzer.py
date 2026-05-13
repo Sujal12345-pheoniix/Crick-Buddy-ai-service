@@ -9,9 +9,9 @@ class CricketAnalyzer:
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=2,
+            model_complexity=1,
             enable_segmentation=False,
-            min_detection_confidence=0.5
+            min_detection_confidence=0.4
         )
         self.landmarks_names = [
             'NOSE', 'LEFT_SHOULDER', 'RIGHT_SHOULDER', 'LEFT_ELBOW', 'RIGHT_ELBOW',
