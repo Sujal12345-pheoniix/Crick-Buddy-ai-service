@@ -15,7 +15,7 @@ from typing import Optional
 from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames, analyze_pose_from_image,
     calculate_angle, score_angle, generate_report, clamp_score,
-    is_cricket_content,
+    validate_cricket_content_async,
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_WRIST, RIGHT_WRIST, LEFT_HIP, RIGHT_HIP,
     LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE,
@@ -177,7 +177,8 @@ async def analyze_batting(
 
         if frames:
             # Validate if it's cricket content
-            if not is_cricket_content(frames[0]):
+            is_valid = await validate_cricket_content_async(frames[0])
+            if not is_valid:
                 raise HTTPException(
                     status_code=400, 
                     detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."

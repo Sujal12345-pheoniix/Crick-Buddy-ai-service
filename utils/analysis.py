@@ -111,11 +111,6 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
         image = cv2.imread(image_path)
         if image is None:
             return None
-        
-        # Check for cricket context (basic heuristic or detector)
-        if not is_cricket_content(image):
-            return {"error": "wrong_content"}
-
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         with mp.solutions.pose.Pose(
@@ -143,48 +138,35 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
         return None
 
 
-def is_cricket_content(image: np.ndarray) -> bool:
+async def validate_cricket_content_async(image: np.ndarray) -> bool:
     """
-    Validate if the image/frame contains cricket-related content.
-    Requires at least a person detected (cricket bat/ball detection is bonus).
+    Validate if the image/frame contains cricket-related content using Gemini Vision.
     Returns True = likely cricket, False = clearly non-cricket.
     """
-    try:
-        from ultralytics import YOLO
-        
-        if not hasattr(is_cricket_content, "_model"):
-            yolo_path = os.getenv("YOLO_WEIGHTS_PATH", "yolov8n.pt")
-            is_cricket_content._model = YOLO(yolo_path)
-        
-        results = is_cricket_content._model(image, verbose=False)
-        
-        found_person = False
-        found_cricket_item = False 
-        
-        # COCO classes: 0: person, 32: sports ball, 34: baseball bat
-        for result in results:
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                
-                if conf < 0.25:  # Lower threshold to catch more cases
-                    continue
-                
-                if cls_id == 0: 
-                    found_person = True
-                if cls_id in [32, 34]:  # sports ball or baseball bat (close to cricket bat)
-                    found_cricket_item = True
-        
-        # Primary requirement: must have a person in frame.
-        # If a person is found + bat/ball detected → definitely cricket.
-        # If only person found → likely cricket (YOLO often misses cricket-specific gear).
-        # If NO person → reject.
-        if not found_person:
-            return False
-        
-        # If we detect a sports ball or bat with a person, that's very strong signal.
-        # If only a person, still allow (cricket bats are often classified as other objects).
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
         return True
+        
+    try:
+        from google import genai
+        import cv2
+        import PIL.Image
+        
+        client = genai.Client(api_key=api_key)
+        
+        # Convert BGR to RGB for PIL
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_img = PIL.Image.fromarray(img_rgb)
+        
+        prompt = "Analyze this image and tell me if it contains someone playing cricket (batting, bowling, fielding) or if it is a cricket ground. Respond ONLY with YES or NO."
+        
+        response = await client.aio.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            contents=[prompt, pil_img]
+        )
+        
+        ans = (response.text or "").strip().upper()
+        return "YES" in ans
     except Exception as e:
         print(f"Cricket validation error: {e}")
         return True  # Fallback: do not block valid users due to model errors

@@ -13,7 +13,7 @@ from typing import Optional
 from utils.analysis import (
     analyze_pose_from_image, analyze_pose_from_video_frames, extract_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
-    is_cricket_content,
+    validate_cricket_content_async,
     LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE,
     LEFT_ANKLE, RIGHT_ANKLE, get_point
@@ -108,21 +108,26 @@ async def analyze_posture(
         posture_metrics = {}
         landmarks_data = None
 
+        import cv2
+        img = cv2.imread(tmp_path)
+        if img is not None:
+            is_valid = await validate_cricket_content_async(img)
+            if not is_valid:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
+                )
+
         # First try MediaPipe image inference.
         landmarks = analyze_pose_from_image(tmp_path)
-
-        if isinstance(landmarks, dict) and landmarks.get("error") == "wrong_content":
-            raise HTTPException(
-                status_code=400, 
-                detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
-            )
 
         # If upload is a video, analyze sampled frames and take a stable middle detection.
         if not landmarks:
             frames = extract_frames(tmp_path, num_frames=24)
             if frames:
                 # Check first frame for cricket content
-                if not is_cricket_content(frames[0]):
+                is_valid = await validate_cricket_content_async(frames[0])
+                if not is_valid:
                     raise HTTPException(
                         status_code=400, 
                         detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
