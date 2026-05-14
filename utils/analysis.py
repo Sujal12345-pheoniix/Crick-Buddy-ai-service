@@ -178,25 +178,37 @@ def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[di
         import mediapipe as mp
         import cv2
         
-        all_landmarks = []
+        def run_inference(complexity, conf):
+            results_list = []
+            with mp.solutions.pose.Pose(
+                static_image_mode=True,
+                model_complexity=complexity,
+                min_detection_confidence=conf,
+                min_tracking_confidence=conf
+            ) as pose:
+                for frame in frames:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = pose.process(frame_rgb)
+                    if results.pose_landmarks:
+                        landmarks = {}
+                        for idx, lm in enumerate(results.pose_landmarks.landmark):
+                            landmarks[idx] = [lm.x, lm.y, lm.z, lm.visibility]
+                        results_list.append(landmarks)
+                    else:
+                        results_list.append(None)
+            return results_list
+
+        # Primary pass: standard complexity
+        all_landmarks = run_inference(complexity=1, conf=0.35)
+        valid_count = sum(1 for lm in all_landmarks if lm is not None)
         
-        with mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            min_detection_confidence=0.4,
-            min_tracking_confidence=0.4
-        ) as pose:
-            for frame in frames:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = pose.process(frame_rgb)
-                if results.pose_landmarks:
-                    landmarks = {}
-                    for idx, lm in enumerate(results.pose_landmarks.landmark):
-                        landmarks[idx] = [lm.x, lm.y, lm.z, lm.visibility]
-                    all_landmarks.append(landmarks)
-                else:
-                    all_landmarks.append(None)
-        
+        # If no humans detected, retry with higher complexity
+        if valid_count == 0:
+            print("No humans detected with model_complexity=1, retrying with complexity=2...")
+            all_landmarks = run_inference(complexity=2, conf=0.3)
+            valid_count = sum(1 for lm in all_landmarks if lm is not None)
+            
+        print(f"Pose Analysis: Detected humans in {valid_count}/{len(frames)} frames.")
         return all_landmarks
     except Exception as e:
         print(f"MediaPipe video analysis error: {e}")

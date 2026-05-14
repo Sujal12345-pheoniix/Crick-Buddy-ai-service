@@ -126,12 +126,13 @@ async def analyze_posture(
         if not landmarks:
             frames = extract_frames(tmp_path, num_frames=24)
             if frames:
-                # Check first frame for cricket content
-                is_valid = await validate_cricket_content_async(frames[0])
+                # Check middle frame for cricket content
+                validation_frame = frames[len(frames) // 2]
+                is_valid = await validate_cricket_content_async(validation_frame)
                 if not is_valid:
                     raise HTTPException(
                         status_code=400, 
-                        detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
+                        detail="Content validation failed. Please ensure the video clearly shows cricket batting or bowling."
                     )
                 
                 sequence_landmarks = analyze_pose_from_video_frames(frames)
@@ -143,7 +144,7 @@ async def analyze_posture(
             posture_metrics = analyze_posture_landmarks(landmarks)
             landmarks_data = landmarks
         else:
-            raise HTTPException(status_code=400, detail="No human detected in the image. Please ensure the player is clearly visible.")
+            raise HTTPException(status_code=400, detail="No human detected in the image/video. Please ensure the player is clearly visible and well-lit.")
 
         # Overall posture score
         scores = [

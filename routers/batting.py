@@ -177,12 +177,13 @@ async def analyze_batting(
         frames = extract_frames(tmp_path, num_frames=30)
 
         if frames:
-            # Validate if it's cricket content
-            is_valid = await validate_cricket_content_async(frames[0])
+            # Validate if it's cricket content (check middle frame to avoid black start frames)
+            validation_frame = frames[len(frames) // 2]
+            is_valid = await validate_cricket_content_async(validation_frame)
             if not is_valid:
                 raise HTTPException(
                     status_code=400, 
-                    detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
+                    detail="Content validation failed. Please ensure the video clearly shows cricket batting or bowling."
                 )
 
             all_landmarks = analyze_pose_from_video_frames(frames)
@@ -197,7 +198,7 @@ async def analyze_batting(
                 # Shot classification
                 batting_metrics['shotType'] = classify_shot(valid)
             else:
-                raise HTTPException(status_code=400, detail="No human detected in the video. Please ensure the player is clearly visible.")
+                raise HTTPException(status_code=400, detail="No human detected in the video. Please ensure the player is clearly visible and well-lit.")
         else:
             raise HTTPException(status_code=400, detail="Invalid video: Could not extract frames.")
 
