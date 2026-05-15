@@ -1,179 +1,176 @@
 """
 Body Posture Analysis Router
-Uses MediaPipe Pose on images to analyze:
-- Shoulder alignment, knee bend, balance, spine position
+MediaPipe + YOLO pipeline:
+  Image/video → YOLO crop → MediaPipe pose → posture metrics
 """
 
 import os
-import random
 import tempfile
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from typing import Optional
+
+import httpx
 
 from utils.analysis import (
     analyze_pose_from_image, analyze_pose_from_video_frames, extract_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
     validate_cricket_content_async,
-    LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW,
+    LEFT_SHOULDER, RIGHT_SHOULDER,
     LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE,
-    LEFT_ANKLE, RIGHT_ANKLE, get_point
+    LEFT_ANKLE, RIGHT_ANKLE, get_point,
 )
 
 router = APIRouter()
 
 
+# ─── Scoring helper ───────────────────────────────────────────────────────────
+
 def _tilt_to_score(tilt: float, scale: float, low: int = 35, high: int = 98) -> int:
-    return clamp_score(high - (tilt * scale), low, high)
+    return clamp_score(high - tilt * scale, low, high)
 
 
 def analyze_posture_landmarks(landmarks: dict) -> dict:
-    """Extract posture metrics from MediaPipe landmarks."""
     metrics = {}
 
-    # Shoulder alignment (horizontal level check)
     l_shoulder = get_point(landmarks, LEFT_SHOULDER)
     r_shoulder = get_point(landmarks, RIGHT_SHOULDER)
     if l_shoulder and r_shoulder:
-        shoulder_tilt = abs(l_shoulder[1] - r_shoulder[1])
-        metrics['shoulderTilt'] = round(shoulder_tilt, 4)
-        metrics['shoulderAlignmentScore'] = _tilt_to_score(shoulder_tilt, 520)
-        if shoulder_tilt < 0.03:
-            metrics['shoulderAlignmentNote'] = "Excellent — shoulders are level"
-        elif shoulder_tilt < 0.07:
-            metrics['shoulderAlignmentNote'] = "Good — minor shoulder tilt detected"
+        tilt = abs(l_shoulder[1] - r_shoulder[1])
+        metrics["shoulderTilt"] = round(tilt, 4)
+        metrics["shoulderAlignmentScore"] = _tilt_to_score(tilt, 520)
+        if tilt < 0.03:
+            metrics["shoulderAlignmentNote"] = "Excellent — shoulders are level"
+        elif tilt < 0.07:
+            metrics["shoulderAlignmentNote"] = "Good — minor shoulder tilt"
         else:
-            metrics['shoulderAlignmentNote'] = "Needs work — significant shoulder imbalance"
+            metrics["shoulderAlignmentNote"] = "Needs work — significant shoulder imbalance"
 
-    # Knee bend angle (left leg)
-    l_hip = get_point(landmarks, LEFT_HIP)
-    l_knee = get_point(landmarks, LEFT_KNEE)
+    l_hip   = get_point(landmarks, LEFT_HIP)
+    l_knee  = get_point(landmarks, LEFT_KNEE)
     l_ankle = get_point(landmarks, LEFT_ANKLE)
     if l_hip and l_knee and l_ankle:
         knee_angle = calculate_angle(l_hip, l_knee, l_ankle)
-        metrics['kneeBendAngle'] = knee_angle
-        metrics['kneeBendScore'] = score_angle(knee_angle, 140, 170)
+        metrics["kneeBendAngle"] = knee_angle
+        metrics["kneeBendScore"] = score_angle(knee_angle, 140, 170)
 
-    # Balance score (hip alignment)
-    l_hip_pt = get_point(landmarks, LEFT_HIP)
-    r_hip_pt = get_point(landmarks, RIGHT_HIP)
-    if l_hip_pt and r_hip_pt:
-        hip_tilt = abs(l_hip_pt[1] - r_hip_pt[1])
-        metrics['hipTilt'] = round(hip_tilt, 4)
-        metrics['balanceScore'] = _tilt_to_score(hip_tilt, 480)
+    r_hip = get_point(landmarks, RIGHT_HIP)
+    if l_hip and r_hip:
+        hip_tilt = abs(l_hip[1] - r_hip[1])
+        metrics["hipTilt"] = round(hip_tilt, 4)
+        metrics["balanceScore"] = _tilt_to_score(hip_tilt, 480)
 
-    # Spine score (shoulder vs hip vertical alignment)
-    if l_shoulder and r_shoulder and l_hip_pt and r_hip_pt:
-        mid_shoulder_x = (l_shoulder[0] + r_shoulder[0]) / 2
-        mid_hip_x = (l_hip_pt[0] + r_hip_pt[0]) / 2
-        spine_offset = abs(mid_shoulder_x - mid_hip_x)
-        metrics['spineOffset'] = round(spine_offset, 4)
-        metrics['spinePosScore'] = _tilt_to_score(spine_offset, 520)
+    if l_shoulder and r_shoulder and l_hip and r_hip:
+        mid_sx = (l_shoulder[0] + r_shoulder[0]) / 2
+        mid_hx = (l_hip[0] + r_hip[0]) / 2
+        offset = abs(mid_sx - mid_hx)
+        metrics["spineOffset"] = round(offset, 4)
+        metrics["spinePosScore"] = _tilt_to_score(offset, 520)
 
     return metrics
 
 
-import httpx
+# ─── Route ────────────────────────────────────────────────────────────────────
 
 @router.post("/posture")
 async def analyze_posture(
     file: Optional[UploadFile] = File(None),
     fileUrl: Optional[str] = Form(None),
-    upload_id: Optional[str] = Form(None)
+    upload_id: Optional[str] = Form(None),
 ):
-    """Analyze body posture from image using MediaPipe Pose."""
     if not file and not fileUrl:
-        raise HTTPException(status_code=400, detail="No file or fileUrl provided")
+        raise HTTPException(400, "No file or fileUrl provided")
 
-    suffix = '.jpg'
+    suffix = ".jpg"
     if file and file.filename:
-        suffix = os.path.splitext(file.filename)[1]
+        suffix = os.path.splitext(file.filename)[1] or ".jpg"
     elif fileUrl:
-        if fileUrl.endswith('.mp4') or fileUrl.endswith('.mov'):
-            suffix = '.mp4'
+        low = fileUrl.lower()
+        if ".mp4" in low or ".mov" in low or ".avi" in low:
+            suffix = ".mp4"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         if file:
-            content = await file.read()
-            tmp.write(content)
-        elif fileUrl:
+            tmp.write(await file.read())
+        else:
             async with httpx.AsyncClient(timeout=300.0) as client:
-                async with client.stream("GET", fileUrl) as response:
-                    if response.status_code == 200:
-                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                            tmp.write(chunk)
-                    else:
-                        raise HTTPException(status_code=400, detail="Failed to download file from URL")
+                async with client.stream("GET", fileUrl) as resp:
+                    if resp.status_code != 200:
+                        raise HTTPException(400, "Failed to download file from URL")
+                    async for chunk in resp.aiter_bytes(1024 * 1024):
+                        tmp.write(chunk)
         tmp_path = tmp.name
 
     try:
-        posture_metrics = {}
-        landmarks_data = None
-
         import cv2
-        img = cv2.imread(tmp_path)
-        if img is not None:
-            is_valid = await validate_cricket_content_async(img)
-            if not is_valid:
+
+        is_video = suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+        landmarks = None
+
+        if not is_video:
+            # ── Image path ────────────────────────────────────────────────────
+            img = cv2.imread(tmp_path)
+            if img is not None:
+                if not await validate_cricket_content_async(img):
+                    raise HTTPException(
+                        400,
+                        "Wrong file uploaded. Please upload a cricket posture image."
+                    )
+            landmarks = analyze_pose_from_image(tmp_path)
+
+        else:
+            # ── Video path ────────────────────────────────────────────────────
+            frames = extract_frames(tmp_path, num_frames=24)
+            if not frames:
+                raise HTTPException(400, "Invalid video: could not extract frames.")
+
+            mid_frame = frames[len(frames) // 2]
+            if not await validate_cricket_content_async(mid_frame):
                 raise HTTPException(
-                    status_code=400, 
-                    detail="Wrong video uploaded. Please upload a cricket batting or bowling clip."
+                    400,
+                    "Content validation failed. Please upload a cricket posture video."
                 )
 
-        # First try MediaPipe image inference.
-        landmarks = analyze_pose_from_image(tmp_path)
+            all_lm = analyze_pose_from_video_frames(frames)
+            valid = [lm for lm in all_lm if lm is not None]
+            if valid:
+                landmarks = valid[len(valid) // 2]
 
-        # If upload is a video, analyze sampled frames and take a stable middle detection.
-        if not landmarks:
-            frames = extract_frames(tmp_path, num_frames=24)
-            if frames:
-                # Check middle frame for cricket content
-                validation_frame = frames[len(frames) // 2]
-                is_valid = await validate_cricket_content_async(validation_frame)
-                if not is_valid:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail="Content validation failed. Please ensure the video clearly shows cricket batting or bowling."
-                    )
-                
-                sequence_landmarks = analyze_pose_from_video_frames(frames)
-                valid = [lm for lm in sequence_landmarks if lm is not None]
-                if valid:
-                    landmarks = valid[len(valid) // 2]
+        if landmarks is None:
+            raise HTTPException(
+                400,
+                "No human detected. Ensure the player is clearly visible, "
+                "well-lit, and unobstructed in the frame."
+            )
 
-        if landmarks:
-            posture_metrics = analyze_posture_landmarks(landmarks)
-            landmarks_data = landmarks
-        else:
-            raise HTTPException(status_code=400, detail="No human detected in the image/video. Please ensure the player is clearly visible and well-lit.")
+        posture_metrics = analyze_posture_landmarks(landmarks)
 
-        # Overall posture score
         scores = [
-            posture_metrics.get('shoulderAlignmentScore', 70),
-            posture_metrics.get('kneeBendScore', 70),
-            posture_metrics.get('balanceScore', 70),
-            posture_metrics.get('spinePosScore', 70),
+            posture_metrics.get("shoulderAlignmentScore", 70),
+            posture_metrics.get("kneeBendScore", 70),
+            posture_metrics.get("balanceScore", 70),
+            posture_metrics.get("spinePosScore", 70),
         ]
-        overall_score = round(sum(scores) / len(scores))
-        posture_metrics['overallPostureScore'] = overall_score
+        overall = round(sum(scores) / len(scores))
+        posture_metrics["overallPostureScore"] = overall
 
-        report = await generate_report(posture_metrics, 'posture')
+        report = await generate_report(posture_metrics, "posture")
 
         return {
             "success": True,
             "type": "posture",
             "upload_id": upload_id,
             "posture_metrics": {
-                "shoulderAlignmentScore": posture_metrics.get('shoulderAlignmentScore', 70),
-                "shoulderAlignmentNote": posture_metrics.get('shoulderAlignmentNote', ''),
-                "kneeBendAngle": posture_metrics.get('kneeBendAngle', 150.0),
-                "kneeBendScore": posture_metrics.get('kneeBendScore', 70),
-                "balanceScore": posture_metrics.get('balanceScore', 70),
-                "spinePosScore": posture_metrics.get('spinePosScore', 70),
-                "overallPostureScore": overall_score
+                "shoulderAlignmentScore": posture_metrics.get("shoulderAlignmentScore", 70),
+                "shoulderAlignmentNote":  posture_metrics.get("shoulderAlignmentNote", ""),
+                "kneeBendAngle":          posture_metrics.get("kneeBendAngle", 150.0),
+                "kneeBendScore":          posture_metrics.get("kneeBendScore", 70),
+                "balanceScore":           posture_metrics.get("balanceScore", 70),
+                "spinePosScore":          posture_metrics.get("spinePosScore", 70),
+                "overallPostureScore":    overall,
             },
-            "overall_score": overall_score,
-            "landmarks": landmarks_data,
-            **report
+            "overall_score": overall,
+            "landmarks": landmarks,
+            **report,
         }
 
     finally:
@@ -181,6 +178,3 @@ async def analyze_posture(
             os.unlink(tmp_path)
         except Exception:
             pass
-
-
-
