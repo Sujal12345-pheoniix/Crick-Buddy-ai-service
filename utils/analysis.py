@@ -478,12 +478,39 @@ def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
     if not drills:
         drills.append("Continue regular training schedule — 3 sessions per week minimum")
 
+    # Dynamic mistakes based on metrics
+    mistakes = []
+    recommendations = ["Review your analysis footage weekly to track muscle memory changes"]
+    best_practices = ["Perform 15 min of dynamic mobility drills before every session"]
+    
+    if type_ == 'batting':
+        if metrics.get('headPositionScore', 100) < 70:
+            mistakes.append("Head falling over the off-side during shot execution")
+        if metrics.get('timingScore', 100) < 75:
+            mistakes.append("Late weight transfer causing poor timing")
+        if metrics.get('followThroughScore', 100) < 70:
+            mistakes.append("Incomplete bat swing and limited follow-through")
+        if not mistakes:
+            mistakes.append("Slight misalignment in initial stance")
+        recommendations.append("Consider adjusting bat weight if swing speed feels slow")
+    elif type_ == 'bowling':
+        if metrics.get('wristPositionScore', 100) < 75:
+            mistakes.append("Dropped wrist at release point")
+        if metrics.get('balanceScore', 100) < 75:
+            mistakes.append("Unstable base during delivery stride")
+        if not mistakes:
+            mistakes.append("Inconsistent run-up momentum")
+        recommendations.append("Ensure bowling spikes have good grip for the landing foot")
+    elif type_ == 'posture':
+        mistakes.append("Uneven weight distribution")
+        recommendations.append("Focus on core strength conditioning")
+
     return {
         "strengths": strengths,
         "weaknesses": weaknesses,
-        "mistakes": ["High center of gravity during impact", "Static footwork", "Limited follow-through extension"],
+        "mistakes": mistakes,
         "improvement_suggestions": suggestions,
         "training_drills": drills,
-        "recommendations": ["Consider a professional bat weighing between 1.1kg - 1.2kg for better swing balance", "Invest in high-quality batting gloves with extra finger protection"],
-        "best_practices": ["Perform 15 min of dynamic mobility drills before every session", "Maintain a hydration level of at least 500ml per hour of play", "Review your analysis footage weekly to track muscle memory changes"]
+        "recommendations": recommendations,
+        "best_practices": best_practices
     }

@@ -23,8 +23,6 @@ ALLOWED_ORIGINS = list(set([
     "https://crickbuddy.tech",
     "https://www.crickbuddy.tech",
     "https://crick-buddy-frontend.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:3001",
 ] + _env_origins))
 
 app.add_middleware(

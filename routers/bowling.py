@@ -148,7 +148,7 @@ async def analyze_bowling(
             # Ball speed estimation
             ball_speed = estimate_ball_speed(frames)
             if ball_speed is None:
-                ball_speed = round(random.uniform(100, 145), 1)
+                raise HTTPException(status_code=400, detail="Could not calculate ball speed from video. Ensure the full bowling action is visible.")
             bowling_metrics['estimatedBallSpeed'] = ball_speed
 
             # Pose analysis
