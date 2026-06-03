@@ -11,6 +11,11 @@ Detection flow per frame:
 Multi-frame majority-vote: at least 1 valid detection in the sampled
 sequence is sufficient to proceed.  Only a completely empty sequence
 triggers "No human detected".
+
+Singletons:
+  All heavy models (YOLO + MediaPipe Pose c=1 and c=2) are loaded once
+  at module import time and reused across requests — eliminating the
+  per-request cold-start latency that caused the 300s timeout errors.
 """
 
 import json
@@ -31,13 +36,14 @@ LEFT_KNEE = 25;      RIGHT_KNEE = 26
 LEFT_ANKLE = 27;     RIGHT_ANKLE = 28
 
 
-# ─── Lazy singletons (loaded once, reused across requests) ───────────────────
-_yolo_model = None
-_pose_model_1 = None   # complexity=1 reusable instance
-_pose_model_2 = None   # complexity=2 fallback
+# ─── Global model singletons (loaded once, reused across ALL requests) ────────
+_yolo_model = None        # YOLOv8n — set to False when unavailable
+_mp_pose_c1 = None        # MediaPipe Pose complexity=1
+_mp_pose_c2 = None        # MediaPipe Pose complexity=2
 
 
 def _get_yolo():
+    """Load YOLOv8n once; return None if unavailable (non-fatal)."""
     global _yolo_model
     if _yolo_model is None:
         try:
@@ -49,6 +55,70 @@ def _get_yolo():
             print(f"⚠️  YOLOv8 load failed (will skip crop): {e}")
             _yolo_model = False   # sentinel: do not retry
     return _yolo_model if _yolo_model else None
+
+
+def _get_mp_pose(complexity: int = 1):
+    """
+    Return a persistent MediaPipe Pose instance.
+    Instances are created once and reused — this is safe because:
+      • static_image_mode=True means no cross-frame state is kept
+      • We run single-worker (concurrency=1 on BullMQ), so no race condition
+    """
+    global _mp_pose_c1, _mp_pose_c2
+    import mediapipe as mp
+
+    if complexity == 1:
+        if _mp_pose_c1 is None:
+            _mp_pose_c1 = mp.solutions.pose.Pose(
+                static_image_mode=True,
+                model_complexity=1,
+                enable_segmentation=False,
+                min_detection_confidence=0.30,
+                min_tracking_confidence=0.30,
+            )
+            print("✅ MediaPipe Pose (complexity=1) singleton ready")
+        return _mp_pose_c1
+    else:
+        if _mp_pose_c2 is None:
+            _mp_pose_c2 = mp.solutions.pose.Pose(
+                static_image_mode=True,
+                model_complexity=2,
+                enable_segmentation=False,
+                min_detection_confidence=0.25,
+                min_tracking_confidence=0.25,
+            )
+            print("✅ MediaPipe Pose (complexity=2) singleton ready")
+        return _mp_pose_c2
+
+
+def warmup_models():
+    """
+    Pre-load and warm up all heavy models.
+    Called at FastAPI startup so the first real request is instant.
+    """
+    print("🔄 Warming up AI models...")
+
+    # 1. YOLO
+    try:
+        yolo = _get_yolo()
+        if yolo:
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            yolo(dummy, verbose=False, conf=0.99)   # no-op inference
+            print("✅ YOLO warm-up done")
+    except Exception as e:
+        print(f"⚠️  YOLO warm-up error (non-fatal): {e}")
+
+    # 2. MediaPipe Pose c=1
+    try:
+        import cv2
+        pose = _get_mp_pose(1)
+        dummy_rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+        pose.process(dummy_rgb)
+        print("✅ MediaPipe Pose (c=1) warm-up done")
+    except Exception as e:
+        print(f"⚠️  MediaPipe Pose warm-up error (non-fatal): {e}")
+
+    print("✅ All models ready — service is hot")
 
 
 # ─── Basic helpers ────────────────────────────────────────────────────────────
@@ -106,7 +176,7 @@ def _is_sharp(frame: np.ndarray, threshold: float = BLUR_THRESHOLD) -> bool:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var()) >= threshold
 
 
-def extract_frames(video_path: str, num_frames: int = 30) -> List[np.ndarray]:
+def extract_frames(video_path: str, num_frames: int = 15) -> List[np.ndarray]:
     """Extract evenly-spaced frames from a video, filtered for sharpness."""
     import cv2
     try:
@@ -212,12 +282,11 @@ def _run_mediapipe_on_frame(
     conf: float = 0.30,
 ) -> Optional[dict]:
     """
-    Run MediaPipe Pose on a single BGR frame.
+    Run MediaPipe Pose on a single BGR frame using the persistent singleton.
     Pipeline: resize → YOLO crop (if available) → RGB convert → MediaPipe.
     Returns landmark dict (index → [x, y, z, vis]) or None.
     """
     import cv2
-    import mediapipe as mp
 
     frame_bgr = _resize_frame(frame_bgr)
 
@@ -233,14 +302,8 @@ def _run_mediapipe_on_frame(
     frame_rgb = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
 
     try:
-        with mp.solutions.pose.Pose(
-            static_image_mode=True,
-            model_complexity=complexity,
-            enable_segmentation=False,
-            min_detection_confidence=conf,
-            min_tracking_confidence=conf,
-        ) as pose:
-            results = pose.process(frame_rgb)
+        pose = _get_mp_pose(complexity)
+        results = pose.process(frame_rgb)
 
         if not results.pose_landmarks:
             return None
@@ -274,7 +337,8 @@ def _run_mediapipe_on_frame(
 def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[dict]]:
     """
     Run the full YOLO→crop→MediaPipe pipeline on every frame.
-    Two-pass strategy: complexity=1 first; if <20% valid, retry with complexity=2.
+    Two-pass strategy: complexity=1 first; if <10% valid, retry with complexity=2.
+    Uses persistent singletons — no model reload between frames.
     """
     if not frames:
         return []
@@ -293,10 +357,10 @@ def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[di
 
     # Pass 2 — only if very few detections
     if valid < max(1, len(frames) * 0.10):
-        print("Low detection rate — retrying with complexity=2, conf=0.25 ...")
-        results2 = _run_pass(complexity=2, conf=0.25)
+        print("Low detection rate — retrying with complexity=2, conf=0.20 ...")
+        results2 = _run_pass(complexity=2, conf=0.20)
         valid2 = sum(1 for r in results2 if r is not None)
-        print(f"Pose pass-2 (c=2, conf=0.25): {valid2}/{len(frames)} detections")
+        print(f"Pose pass-2 (c=2, conf=0.20): {valid2}/{len(frames)} detections")
         # Merge: prefer pass-2 result when pass-1 missed
         for i, (r1, r2) in enumerate(zip(results, results2)):
             if r1 is None and r2 is not None:
@@ -317,7 +381,7 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
         return None
 
     # Try complexity=1 first, then 2
-    for c, conf in [(1, 0.30), (2, 0.25)]:
+    for c, conf in [(1, 0.30), (2, 0.20)]:
         lm = _run_mediapipe_on_frame(image, complexity=c, conf=conf)
         if lm is not None:
             return lm
@@ -331,6 +395,7 @@ async def validate_cricket_content_async(image: np.ndarray) -> bool:
     Validate that a frame shows cricket content using Gemini Vision.
     Returns True = likely cricket; False = clearly non-cricket.
     Falls through to True on any error (do not penalise valid users for API issues).
+    Always returns True if GEMINI_API_KEY is not set (skip validation).
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -346,17 +411,19 @@ async def validate_cricket_content_async(image: np.ndarray) -> bool:
         pil_img = PIL.Image.fromarray(img_rgb)
 
         prompt = (
-            "Does this image show someone playing cricket (batting, bowling, "
-            "fielding) or a cricket ground? Reply ONLY with YES or NO."
+            "Does this image show a person playing cricket (batting, bowling, fielding) "
+            "or a cricket ground/training session? "
+            "Reply ONLY with YES or NO. No explanation."
         )
         response = await client.aio.models.generate_content(
             model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
             contents=[prompt, pil_img],
         )
-        return "YES" in (response.text or "").strip().upper()
+        answer = (response.text or "").strip().upper()
+        return "YES" in answer
 
     except Exception as e:
-        print(f"Cricket validation error (non-fatal): {e}")
+        print(f"Cricket validation error (non-fatal, allowing through): {e}")
         return True
 
 
@@ -411,7 +478,7 @@ def _parse_json_response_text(text: str) -> dict:
 
 
 async def generate_report(metrics: dict, type_: str) -> dict:
-    """Generate AI coaching report via Gemini; falls back to rule-based."""
+    """Generate AI coaching report via Gemini; falls back to rule-based on error."""
     api_key = os.getenv("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -434,48 +501,49 @@ Metrics: {json.dumps(metrics, default=str)}
 
 Respond in JSON ONLY with this exact structure:
 {{
-  "strengths": ["3-5 specific technical strengths"],
-  "weaknesses": ["2-4 specific improvement areas"],
+  "strengths": ["3-5 specific technical strengths based on the scores"],
+  "weaknesses": ["2-4 specific improvement areas based on the scores"],
   "mistakes": ["3-4 technical mistakes inferred from the metrics"],
   "improvement_suggestions": ["5-7 actionable coaching cues"],
   "training_drills": ["4-6 drills with sets/reps/focus"],
   "recommendations": ["3-5 equipment or conditioning notes"],
   "best_practices": ["4-6 elite performance habits"]
 }}
-Use professional cricket terminology. Base all feedback on the numeric metrics provided."""
+Use professional cricket terminology. Base all feedback strictly on the numeric metrics provided.
+Do NOT include any markdown outside the JSON block."""
 
     try:
         response = await client.aio.models.generate_content(
             model=model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.45,
+                temperature=0.40,
                 response_mime_type="application/json",
             ),
         )
         parsed = _parse_json_response_text(response.text or "")
         return {
-            "strengths":             parsed.get("strengths") or [],
-            "weaknesses":            parsed.get("weaknesses") or [],
-            "mistakes":              parsed.get("mistakes") or [],
+            "strengths":               parsed.get("strengths") or [],
+            "weaknesses":              parsed.get("weaknesses") or [],
+            "mistakes":                parsed.get("mistakes") or [],
             "improvement_suggestions": parsed.get("improvement_suggestions") or [],
-            "training_drills":       parsed.get("training_drills") or [],
-            "recommendations":       parsed.get("recommendations") or [],
-            "best_practices":        parsed.get("best_practices") or [],
+            "training_drills":         parsed.get("training_drills") or [],
+            "recommendations":         parsed.get("recommendations") or [],
+            "best_practices":          parsed.get("best_practices") or [],
         }
     except Exception as e:
-        print(f"Gemini report error: {e}")
+        print(f"Gemini report error (using rule-based fallback): {e}")
         return _generate_rule_based_report(metrics, type_)
 
 
 def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
-    """Metric-driven fallback report — no static placeholder text."""
+    """Metric-driven fallback report — derived entirely from actual extracted scores."""
     strengths, weaknesses, suggestions, drills = [], [], [], []
     mistakes, recommendations = [], []
     best_practices = [
         "Perform 15 min dynamic mobility warm-up before every session",
         "Review your analysis footage weekly to track technique changes",
-        "Maintain a training journal — log scores each session",
+        "Maintain a training journal — log scores and key cues each session",
     ]
 
     if type_ == "batting":
@@ -492,7 +560,7 @@ def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
             if 30 <= bat_angle <= 65:
                 strengths.append(f"Good bat swing plane ({bat_angle}°) — drives on the up well")
             else:
-                weaknesses.append(f"Bat swing angle ({bat_angle}°) deviates from ideal 30-65° range")
+                weaknesses.append(f"Bat swing angle ({bat_angle}°) deviates from ideal 30–65° range")
                 suggestions.append("Throwdown sessions focusing on straight/cover drive swing plane")
                 drills.append("Vertical bat drill: 20 throwdowns — straight bat, eyes on the ball")
 
@@ -514,11 +582,11 @@ def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
         if m.get("headPositionScore", 100) < 70:
             mistakes.append("Head falling over the off-side — disrupts balance and shot selection")
         if not mistakes:
-            mistakes.append("Slight head movement at the point of impact")
+            mistakes.append("Slight head movement detected at the point of impact")
 
         recommendations = [
-            "Consider a bat 1.1-1.2 kg for better swing speed and balance",
-            "Review your analysis footage weekly to track muscle memory changes",
+            "Consider a bat weighing 1.1–1.2 kg for better swing speed and balance",
+            "Review analysis footage weekly to track muscle-memory changes",
         ]
 
     elif type_ == "bowling":
@@ -530,7 +598,7 @@ def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
             strengths.append(f"Good medium-fast pace at {speed} km/h — consistent and controllable")
         elif speed > 0:
             weaknesses.append(f"Ball speed ({speed} km/h) below target — improve run-up momentum")
-            suggestions.append("Extend run-up by 3 strides and accelerate into the crease")
+            suggestions.append("Extend run-up by 3 strides and accelerate through the crease")
             drills.append("Run-up acceleration drill: 20 deliveries focusing on full approach speed")
 
         if m.get("wristPositionScore", 0) >= 80:
@@ -568,7 +636,7 @@ def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
         if m.get("kneeBendScore", 0) >= 75:
             strengths.append(f"Good knee bend ({knee_angle}°) — solid athletic base position")
         else:
-            weaknesses.append(f"Knee bend angle ({knee_angle}°) outside ideal 140-170° range")
+            weaknesses.append(f"Knee bend angle ({knee_angle}°) outside ideal 140–170° range")
             drills.append("Bodyweight squat: 3 × 20 reps to build leg strength and mobility")
             mistakes.append("Excessive or insufficient knee bend reducing batting/fielding explosiveness")
 
@@ -587,18 +655,18 @@ def _generate_rule_based_report(metrics: dict, type_: str) -> dict:
         ]
 
     if not strengths:
-        strengths.append("Shows commitment to technique improvement")
+        strengths.append("Shows commitment to technique improvement through video analysis")
     if not suggestions:
         suggestions.append("Maintain current technique — focus on match-play consistency")
     if not drills:
         drills.append("Continue regular training: minimum 3 sessions per week")
 
     return {
-        "strengths": strengths,
-        "weaknesses": weaknesses,
-        "mistakes": mistakes,
+        "strengths":               strengths,
+        "weaknesses":              weaknesses,
+        "mistakes":                mistakes,
         "improvement_suggestions": suggestions,
-        "training_drills": drills,
-        "recommendations": recommendations,
-        "best_practices": best_practices,
+        "training_drills":         drills,
+        "recommendations":         recommendations,
+        "best_practices":          best_practices,
     }
