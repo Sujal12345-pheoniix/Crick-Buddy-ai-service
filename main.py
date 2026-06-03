@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+import asyncio
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 from routers import batting, bowling, posture, chatbot
@@ -14,6 +16,21 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+# ─── Request Timeout Middleware ─────────────────────────────────────────────
+REQUEST_TIMEOUT_SECS = int(os.getenv("REQUEST_TIMEOUT_SECS", "480"))  # 8 min
+
+
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT_SECS)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"detail": f"Request exceeded {REQUEST_TIMEOUT_SECS}s server timeout. Try a shorter video."},
+        )
+
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 # Build allowed origins from environment (comma-separated) + hardcoded known domains
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
@@ -23,6 +40,8 @@ ALLOWED_ORIGINS = list(set([
     "https://crickbuddy.tech",
     "https://www.crickbuddy.tech",
     "https://crick-buddy-frontend.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ] + _env_origins))
 
 app.add_middleware(

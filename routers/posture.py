@@ -119,7 +119,7 @@ async def analyze_posture(
 
         else:
             # ── Video path ────────────────────────────────────────────────────
-            frames = extract_frames(tmp_path, num_frames=24)
+            frames = extract_frames(tmp_path, num_frames=12)
             if not frames:
                 raise HTTPException(400, "Invalid video: could not extract frames.")
 

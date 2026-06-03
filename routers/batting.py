@@ -140,8 +140,8 @@ async def analyze_batting(
         tmp_path = tmp.name
 
     try:
-        # ── 1. Extract frames (blur-filtered) ────────────────────────────────
-        frames = extract_frames(tmp_path, num_frames=30)
+        # ── 1. Extract frames (blur-filtered) ────────────────────────────────────
+        frames = extract_frames(tmp_path, num_frames=15)
         if not frames:
             raise HTTPException(400, "Invalid video: could not extract frames.")
 

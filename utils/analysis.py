@@ -87,7 +87,7 @@ def get_point(landmarks: dict, idx: int) -> Optional[List[float]]:
 # ─── Frame utilities ──────────────────────────────────────────────────────────
 
 TARGET_W, TARGET_H = 640, 480
-BLUR_THRESHOLD = 60.0    # Laplacian variance; frames below this are skipped
+BLUR_THRESHOLD = 40.0    # Laplacian variance; frames below this are skipped
 
 
 def _resize_frame(frame: np.ndarray) -> np.ndarray:
@@ -292,7 +292,7 @@ def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[di
     print(f"Pose pass-1 (c=1, conf=0.30): {valid}/{len(frames)} detections")
 
     # Pass 2 — only if very few detections
-    if valid < max(1, len(frames) * 0.20):
+    if valid < max(1, len(frames) * 0.10):
         print("Low detection rate — retrying with complexity=2, conf=0.25 ...")
         results2 = _run_pass(complexity=2, conf=0.25)
         valid2 = sum(1 for r in results2 if r is not None)
