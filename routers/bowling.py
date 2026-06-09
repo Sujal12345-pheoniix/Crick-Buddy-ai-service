@@ -1,7 +1,14 @@
 """
-Bowling Video Analysis Router
-MediaPipe + YOLO pipeline:
-  Frame sampling → blur filter → YOLO crop → MediaPipe pose → feature extraction
+Bowling Video Analysis Router — Deterministic Pipeline
+======================================================
+All scores come from measured pose landmarks across MULTIPLE frames.
+No hardcoded fallback speeds. No random values.
+Every score is traceable to a formula in utils/analysis.py.
+
+Pipeline:
+  Frame sampling → Blur filter → YOLO crop → MediaPipe pose
+  → Full-sequence feature extraction → Deterministic scoring
+  → Fault detection with evidence → LLM narration only
 """
 
 import os
@@ -12,9 +19,19 @@ from typing import Optional
 import httpx
 
 from utils.analysis import (
-    extract_frames, analyze_pose_from_video_frames, estimate_ball_speed,
+    extract_frames, analyze_pose_from_video_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
     validate_cricket_content_async,
+    estimate_ball_speed, classify_ball_speed,
+    # Deterministic scoring functions
+    calculate_arm_smoothness,
+    calculate_release_point_score,
+    calculate_balance_score,
+    calculate_shoulder_alignment,
+    detect_faults,
+    compute_overall_bowling_score,
+    extract_raw_frame_metrics,
+    # Landmark IDs
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER,
     LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST,
     LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE,
@@ -24,69 +41,59 @@ from utils.analysis import (
 router = APIRouter()
 
 
-# ─── Scoring helpers ──────────────────────────────────────────────────────────
+def classify_bowling_style(speed_class: str, arm_angle: float) -> str:
+    """Classify bowling style from speed classification and arm angle."""
+    if speed_class == "Fast":
+        return "Fast Bowler"
+    if speed_class == "Medium-Fast":
+        return "Medium-Fast Bowler"
+    if speed_class == "Medium":
+        return "Swing Bowler" if arm_angle > 80 else "Medium Pace Bowler"
+    if arm_angle > 75:
+        return "Off Spin Bowler"
+    return "Leg Spin / Wrist Spin Bowler"
 
-def _wrist_position_score(wrist_y: float, elbow_y: float) -> int:
-    delta = elbow_y - wrist_y
+
+def analyze_wrist_position(frames: list) -> dict:
+    """
+    Wrist position at release: wrist should be above elbow.
+    Measures the vertical delta between wrist and elbow at the
+    frame with highest wrist position (minimum wrist Y).
+    """
+    min_wrist_y = 1.0
+    best_frame = None
+    for f in frames:
+        if not f:
+            continue
+        rw = get_point(f, RIGHT_WRIST)
+        if rw and rw[1] < min_wrist_y:
+            min_wrist_y = rw[1]
+            best_frame = f
+
+    if not best_frame:
+        return {"score": 50, "note": "Could not detect release frame for wrist analysis"}
+
+    rw = get_point(best_frame, RIGHT_WRIST)
+    re = get_point(best_frame, RIGHT_ELBOW)
+
+    if not rw or not re:
+        return {"score": 50, "note": "Wrist or elbow not visible at release frame"}
+
+    # Positive delta = wrist above elbow (good)
+    delta = re[1] - rw[1]
     if delta >= 0:
-        return clamp_score(74 + delta * 240, 45, 98)
-    return clamp_score(68 + delta * 180, 30, 90)
+        score = clamp_score(74 + delta * 240, 45, 98)
+    else:
+        score = clamp_score(68 + delta * 180, 30, 90)
 
+    note = (
+        "Good — wrist above elbow at release, stable seam position"
+        if delta >= 0
+        else "Needs work — dropped wrist at release affects seam and swing"
+    )
 
-def _release_point_score(wrist_y: float, nose_y: float) -> int:
-    delta = nose_y - wrist_y
-    if delta >= 0:
-        return clamp_score(78 + delta * 220, 45, 98)
-    return clamp_score(72 + delta * 170, 30, 90)
+    return {"score": score, "wristElbowDelta": round(delta, 4), "note": note}
 
-
-def classify_bowling_style(ball_speed: float, arm_angle: float) -> str:
-    if ball_speed >= 135:    return "Fast Bowler"
-    if ball_speed >= 120:    return "Medium-Fast"
-    if ball_speed >= 100:
-        return "Swing Bowler" if arm_angle > 80 else "Medium Pace"
-    return "Off Spinner" if arm_angle > 75 else "Leg Spinner"
-
-
-def analyze_bowling_landmarks(landmarks: dict) -> dict:
-    metrics = {}
-
-    r_shoulder = get_point(landmarks, RIGHT_SHOULDER)
-    r_elbow    = get_point(landmarks, RIGHT_ELBOW)
-    r_wrist    = get_point(landmarks, RIGHT_WRIST)
-    if r_shoulder and r_elbow and r_wrist:
-        arm_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
-        metrics["armRotationAngle"] = arm_angle
-        metrics["armRotationScore"] = score_angle(arm_angle, 160, 180)
-
-    if r_wrist and r_elbow:
-        metrics["wristPositionScore"] = _wrist_position_score(r_wrist[1], r_elbow[1])
-        metrics["wristPositionNote"] = (
-            "Good — wrist over the ball at release"
-            if r_wrist[1] < r_elbow[1]
-            else "Needs work — dropped wrist affects seam position"
-        )
-
-    l_hip   = get_point(landmarks, LEFT_HIP)
-    l_knee  = get_point(landmarks, LEFT_KNEE)
-    l_ankle = get_point(landmarks, LEFT_ANKLE)
-    if l_hip and l_knee and l_ankle:
-        bal = calculate_angle(l_hip, l_knee, l_ankle)
-        metrics["balanceScore"] = score_angle(bal, 170, 180)
-
-    nose = get_point(landmarks, NOSE)
-    if r_wrist and nose:
-        metrics["releasePointScore"] = _release_point_score(r_wrist[1], nose[1])
-        metrics["releasePointNote"] = (
-            "High release point — good for bounce extraction"
-            if r_wrist[1] < nose[1]
-            else "Low release point — ball may lack bounce"
-        )
-
-    return metrics
-
-
-# ─── Route ────────────────────────────────────────────────────────────────────
 
 @router.post("/bowling")
 async def analyze_bowling(
@@ -114,12 +121,12 @@ async def analyze_bowling(
         tmp_path = tmp.name
 
     try:
-        # ── 1. Extract frames ─────────────────────────────────────────────────────────
-        frames = extract_frames(tmp_path, num_frames=15)
+        # ── 1. Extract frames ────────────────────────────────────────────────
+        frames = extract_frames(tmp_path, num_frames=20)
         if not frames:
             raise HTTPException(400, "Invalid video: could not extract frames.")
 
-        # ── 2. Cricket content validation ─────────────────────────────────────
+        # ── 2. Cricket content validation ────────────────────────────────
         mid_frame = frames[len(frames) // 2]
         if not await validate_cricket_content_async(mid_frame):
             raise HTTPException(
@@ -127,14 +134,17 @@ async def analyze_bowling(
                 "Content validation failed. Please upload a cricket bowling video."
             )
 
-        # ── 3. Ball speed via optical flow ──────────────────────────────────
+        # ── 3. Ball speed via optical flow ────────────────────────────────
+        # Returns None if ball not trackable — we report this honestly
         ball_speed = estimate_ball_speed(frames)
-        if ball_speed is None:
-            # Fallback — estimate from typical medium-pace; still produce a full report
-            ball_speed = 115.0
+        speed_classification = classify_ball_speed(ball_speed)
+        speed_note = (
+            f"Estimated relative speed: {ball_speed} km/h (classification: {speed_classification})"
+            if ball_speed is not None
+            else "Ball not detected in video — ensure ball is visible for speed classification"
+        )
 
-        # ── 4. Multi-frame pose detection ─────────────────────────────────────
-        bowling_metrics: dict = {"estimatedBallSpeed": ball_speed}
+        # ── 4. Multi-frame pose detection ────────────────────────────────
         all_landmarks = analyze_pose_from_video_frames(frames)
         valid = [lm for lm in all_landmarks if lm is not None]
 
@@ -145,23 +155,65 @@ async def analyze_bowling(
                 "visible, well-lit, and in the centre of the frame."
             )
 
-        mid_lm = valid[len(valid) // 2]
-        bowling_metrics.update(analyze_bowling_landmarks(mid_lm))
-        bowling_metrics["bowlingStyle"] = classify_bowling_style(
-            ball_speed, bowling_metrics.get("armRotationAngle", 160)
-        )
+        # ── 5. TEMPORAL ANALYSIS — uses ALL frames ──────────────────────────
+        arm_result     = calculate_arm_smoothness(all_landmarks, RIGHT_WRIST)
+        release_result = calculate_release_point_score(all_landmarks)
+        balance_result = calculate_balance_score(all_landmarks)
+        shoulder_result = calculate_shoulder_alignment(all_landmarks)
+        wrist_result   = analyze_wrist_position(all_landmarks)
 
-        # ── 5. Score aggregation ──────────────────────────────────────────────
-        scores = [
-            bowling_metrics.get("wristPositionScore", 70),
-            bowling_metrics.get("armRotationScore", 70),
-            bowling_metrics.get("releasePointScore", 70),
-            bowling_metrics.get("balanceScore", 70),
-        ]
-        overall = round(sum(scores) / len(scores))
+        # Get arm angle from best release frame for style classification
+        min_wrist_y = 1.0
+        best_frame = None
+        for f in all_landmarks:
+            if not f:
+                continue
+            rw = get_point(f, RIGHT_WRIST)
+            if rw and rw[1] < min_wrist_y:
+                min_wrist_y = rw[1]
+                best_frame = f
+
+        arm_angle_at_release = release_result.get("releaseArmAngle") or 165.0
+        bowling_style = classify_bowling_style(speed_classification, arm_angle_at_release)
+
+        # ── 6. Compile all metrics ────────────────────────────────────────────
+        bowling_metrics = {
+            # Temporal scores
+            "armSmoothnessScore":     arm_result["score"],
+            "avgJerk":                arm_result["avgJerk"],
+            "armSmoothnessNote":      arm_result["note"],
+            "releasePointScore":      release_result["score"],
+            "peakWristY":             release_result["peakWristY"],
+            "releaseArmAngle":        release_result.get("releaseArmAngle"),
+            "releaseHeightScore":     release_result.get("heightScore"),
+            "releaseExtensionScore":  release_result.get("extensionScore"),
+            "releasePointNote":       release_result["note"],
+            "balanceScore":           balance_result["score"],
+            "avgHipTilt":             balance_result["avgHipTilt"],
+            "balanceNote":            balance_result["note"],
+            "shoulderAlignmentScore": shoulder_result["score"],
+            "wristPositionScore":     wrist_result["score"],
+            "wristElbowDelta":        wrist_result.get("wristElbowDelta"),
+            "wristPositionNote":      wrist_result["note"],
+            # Speed (honest reporting)
+            "estimatedBallSpeed":     ball_speed,
+            "speedClassification":    speed_classification,
+            "speedNote":              speed_note,
+            # Classification
+            "armRotationAngle":       arm_angle_at_release,
+            "bowlingStyle":           bowling_style,
+        }
+
+        # ── 7. Deterministic overall score ────────────────────────────────────
+        overall = compute_overall_bowling_score(bowling_metrics)
         bowling_metrics["overallBowlingScore"] = overall
 
-        report = await generate_report(bowling_metrics, "bowling")
+        # ── 8. Fault detection (evidence-based) ──────────────────────────────
+        faults = detect_faults(bowling_metrics, "bowling")
+        fault_codes = [f["faultCode"] for f in faults]
+
+        # ── 9. LLM report (narration only) ──────────────────────────────────
+        report = await generate_report(bowling_metrics, "bowling", faults)
 
         return {
             "success": True,
@@ -170,19 +222,30 @@ async def analyze_bowling(
             "frames_analysed": len(frames),
             "frames_with_pose": len(valid),
             "bowling_metrics": {
-                "wristPositionScore":  bowling_metrics.get("wristPositionScore", 70),
-                "wristPositionNote":   bowling_metrics.get("wristPositionNote", ""),
-                "armRotationAngle":    bowling_metrics.get("armRotationAngle", 165.0),
-                "armRotationScore":    bowling_metrics.get("armRotationScore", 70),
-                "releasePointScore":   bowling_metrics.get("releasePointScore", 70),
-                "releasePointNote":    bowling_metrics.get("releasePointNote", ""),
-                "estimatedBallSpeed":  ball_speed,
-                "balanceScore":        bowling_metrics.get("balanceScore", 70),
-                "bowlingStyle":        bowling_metrics.get("bowlingStyle", "Medium Pace"),
-                "overallBowlingScore": overall,
+                "armSmoothnessScore":     bowling_metrics["armSmoothnessScore"],
+                "avgJerk":                bowling_metrics["avgJerk"],
+                "armSmoothnessNote":      bowling_metrics["armSmoothnessNote"],
+                "releasePointScore":      bowling_metrics["releasePointScore"],
+                "peakWristY":             bowling_metrics["peakWristY"],
+                "releaseArmAngle":        bowling_metrics["releaseArmAngle"],
+                "releasePointNote":       bowling_metrics["releasePointNote"],
+                "balanceScore":           bowling_metrics["balanceScore"],
+                "balanceNote":            bowling_metrics["balanceNote"],
+                "wristPositionScore":     bowling_metrics["wristPositionScore"],
+                "wristPositionNote":      bowling_metrics["wristPositionNote"],
+                "shoulderAlignmentScore": bowling_metrics["shoulderAlignmentScore"],
+                "estimatedBallSpeed":     ball_speed,
+                "speedClassification":    speed_classification,
+                "speedNote":              speed_note,
+                "armRotationAngle":       bowling_metrics["armRotationAngle"],
+                "bowlingStyle":           bowling_style,
+                "overallBowlingScore":    overall,
             },
             "overall_score": overall,
-            "landmarks": mid_lm,
+            "faults": faults,
+            "fault_codes": fault_codes,
+            "raw_frame_metrics": extract_raw_frame_metrics(all_landmarks, "bowling"),
+            "landmarks": best_frame,
             **report,
         }
 

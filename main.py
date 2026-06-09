@@ -94,15 +94,15 @@ async def startup_event():
     This ensures every subsequent request is served by already-warm models,
     eliminating the first-request cold-start that caused timeouts.
     """
-    print("🚀 CrickBuddy AI Service starting up...")
+    print("[Start] CrickBuddy AI Service starting up...")
     loop = asyncio.get_event_loop()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             await loop.run_in_executor(pool, _run_warmup)
     except Exception as e:
         # Non-fatal — service still works; first request will load models
-        print(f"⚠️  Startup warmup failed (non-fatal): {e}")
-    print("✅ Startup complete — ready to serve requests")
+        print(f"[Warn] Startup warmup failed (non-fatal): {e}")
+    print("[Ready] Startup complete — ready to serve requests")
 
 
 def _run_warmup():
@@ -111,7 +111,7 @@ def _run_warmup():
         from utils.analysis import warmup_models
         warmup_models()
     except Exception as e:
-        print(f"⚠️  warmup_models error: {e}")
+        print(f"[Warn] warmup_models error: {e}")
 
 
 # ─── Health & Root ────────────────────────────────────────────────────────────

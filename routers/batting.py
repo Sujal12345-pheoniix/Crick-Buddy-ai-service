@@ -1,7 +1,14 @@
 """
-Batting Video Analysis Router
-MediaPipe + YOLO pipeline:
-  Frame sampling → blur filter → YOLO crop → MediaPipe pose → feature extraction
+Batting Video Analysis Router — Deterministic Pipeline
+=======================================================
+All scores come from measured pose landmarks across MULTIPLE frames.
+No random values. No single-frame snapshots.
+Every score is traceable to a formula defined in utils/analysis.py.
+
+Pipeline:
+  Frame sampling → Blur filter → YOLO crop → MediaPipe pose
+  → Full-sequence feature extraction → Deterministic scoring
+  → Fault detection with evidence → LLM narration only
 """
 
 import os
@@ -15,6 +22,17 @@ from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
     validate_cricket_content_async,
+    # Deterministic scoring functions
+    calculate_head_stability,
+    calculate_timing_score,
+    calculate_balance_score,
+    calculate_stride_score,
+    calculate_follow_through_score,
+    calculate_shoulder_alignment,
+    detect_faults,
+    compute_overall_batting_score,
+    extract_raw_frame_metrics,
+    # Landmark IDs
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER,
     LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST,
     LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE,
@@ -24,24 +42,11 @@ from utils.analysis import (
 router = APIRouter()
 
 
-# ─── Scoring helpers ──────────────────────────────────────────────────────────
-
-def _head_position_score(head_offset: float) -> int:
-    return clamp_score(98 - head_offset * 280, 40, 98)
-
-
-def _follow_through_score(wrist_y: float, nose_y: float) -> int:
-    delta = nose_y - wrist_y
-    if delta >= 0:
-        return clamp_score(76 + delta * 220, 50, 98)
-    return clamp_score(68 + delta * 180, 35, 90)
-
-
 def classify_shot(landmarks_list: list) -> str:
-    """Geometry-based shot classifier from pose sequence."""
+    """Geometry-based shot classifier from full pose sequence."""
     valid = [lm for lm in landmarks_list if lm]
     if not valid:
-        return "Straight Drive"
+        return "Unknown"
     try:
         wrist_x, shoulder_x, knee_angles = [], [], []
         for lm in valid:
@@ -51,68 +56,61 @@ def classify_shot(landmarks_list: list) -> str:
             rk = get_point(lm, RIGHT_KNEE)
             ra = get_point(lm, RIGHT_ANKLE)
             if rw and rs:
-                wrist_x.append(rw[0]); shoulder_x.append(rs[0])
+                wrist_x.append(rw[0])
+                shoulder_x.append(rs[0])
             if rh and rk and ra:
                 knee_angles.append(calculate_angle(rh, rk, ra))
 
         if not wrist_x:
             return "Straight Drive"
+
         x_travel = wrist_x[-1] - wrist_x[0]
-        offset   = wrist_x[-1] - shoulder_x[-1]
+        offset = wrist_x[-1] - shoulder_x[-1]
         avg_knee = sum(knee_angles) / len(knee_angles) if knee_angles else 150.0
 
-        if avg_knee < 128:            return "Sweep"
-        if offset > 0.15 and x_travel > 0.12:  return "Pull Shot"
-        if offset < -0.12 and x_travel < -0.10: return "Cut Shot"
+        if avg_knee < 128:                              return "Sweep"
+        if offset > 0.15 and x_travel > 0.12:          return "Pull Shot"
+        if offset < -0.12 and x_travel < -0.10:        return "Cut Shot"
         if abs(offset) < 0.06 and abs(x_travel) < 0.08: return "Straight Drive"
-        if x_travel > 0.04:          return "Flick"
+        if x_travel > 0.04:                            return "Flick"
         return "Cover Drive"
     except Exception as e:
         print(f"Shot classification error: {e}")
         return "Straight Drive"
 
 
-def analyze_batting_landmarks(landmarks: dict) -> dict:
+def analyze_stance_from_single_frame(landmarks: dict) -> dict:
+    """
+    Stance metrics that require a single best-pose frame (wrist-elbow-shoulder angle).
+    Everything else comes from temporal (multi-frame) analysis.
+    """
     metrics = {}
 
-    nose       = get_point(landmarks, NOSE)
-    l_shoulder = get_point(landmarks, LEFT_SHOULDER)
-    r_shoulder = get_point(landmarks, RIGHT_SHOULDER)
-    if nose and l_shoulder and r_shoulder:
-        mid_sx = (l_shoulder[0] + r_shoulder[0]) / 2
-        offset = abs(nose[0] - mid_sx)
-        metrics["headOffset"] = round(offset, 4)
-        if offset < 0.05:
-            metrics["headPosition"] = "Excellent — aligned over off stump"
-        elif offset < 0.12:
-            metrics["headPosition"] = "Good — slight lateral movement"
-        else:
-            metrics["headPosition"] = "Needs work — head falling over"
-        metrics["headPositionScore"] = _head_position_score(offset)
-
-    r_wrist    = get_point(landmarks, RIGHT_WRIST)
-    r_elbow    = get_point(landmarks, RIGHT_ELBOW)
+    # Bat swing angle from best-pose frame
+    r_wrist = get_point(landmarks, RIGHT_WRIST)
+    r_elbow = get_point(landmarks, RIGHT_ELBOW)
     r_shoulder = get_point(landmarks, RIGHT_SHOULDER)
     if r_wrist and r_elbow and r_shoulder:
         swing = calculate_angle(r_wrist, r_elbow, r_shoulder)
         metrics["batSwingAngle"] = swing
-        metrics["stanceScore"]   = score_angle(swing, 30, 70)
+        metrics["stanceScore"] = score_angle(swing, 30, 70)
 
-    l_hip   = get_point(landmarks, LEFT_HIP)
-    l_knee  = get_point(landmarks, LEFT_KNEE)
-    l_ankle = get_point(landmarks, LEFT_ANKLE)
-    if l_hip and l_knee and l_ankle:
-        knee = calculate_angle(l_hip, l_knee, l_ankle)
-        metrics["kneeBendAngle"] = knee
-        metrics["timingScore"]   = score_angle(knee, 120, 160)
-
-    if r_wrist and nose:
-        metrics["followThroughScore"] = _follow_through_score(r_wrist[1], nose[1])
+    # Wrist position score
+    r_elbow_pt = get_point(landmarks, RIGHT_ELBOW)
+    if r_wrist and r_elbow_pt:
+        delta = r_elbow_pt[1] - r_wrist[1]
+        if delta >= 0:
+            metrics["wristPositionScore"] = clamp_score(74 + delta * 240, 45, 98)
+        else:
+            metrics["wristPositionScore"] = clamp_score(68 + delta * 180, 30, 90)
+        metrics["wristNote"] = (
+            "Good — wrist above elbow at top of backswing"
+            if delta >= 0
+            else "Needs work — wrist below elbow, reducing bat control"
+        )
 
     return metrics
 
-
-# ─── Route ────────────────────────────────────────────────────────────────────
 
 @router.post("/batting")
 async def analyze_batting(
@@ -140,12 +138,12 @@ async def analyze_batting(
         tmp_path = tmp.name
 
     try:
-        # ── 1. Extract frames (blur-filtered) ────────────────────────────────────
-        frames = extract_frames(tmp_path, num_frames=15)
+        # ── 1. Extract frames (more frames = better temporal analysis) ────────
+        frames = extract_frames(tmp_path, num_frames=20)
         if not frames:
             raise HTTPException(400, "Invalid video: could not extract frames.")
 
-        # ── 2. Cricket content validation (non-blocking — skipped if no key) ─
+        # ── 2. Cricket content validation via Gemini Vision ───────────────────
         mid_frame = frames[len(frames) // 2]
         if not await validate_cricket_content_async(mid_frame):
             raise HTTPException(
@@ -164,24 +162,67 @@ async def analyze_batting(
                 "visible, well-lit, and in the centre of the frame."
             )
 
-        # ── 4. Use the most information-rich frame for primary metrics ────────
-        mid_lm = valid[len(valid) // 2]
-        batting_metrics = analyze_batting_landmarks(mid_lm)
-        batting_metrics["shotType"] = classify_shot(valid)
+        # ── 4. TEMPORAL ANALYSIS — uses ALL frames, not just one ──────────────
+        head_result    = calculate_head_stability(all_landmarks)
+        timing_result  = calculate_timing_score(all_landmarks)
+        balance_result = calculate_balance_score(all_landmarks)
+        stride_result  = calculate_stride_score(all_landmarks)
+        follow_result  = calculate_follow_through_score(all_landmarks)
+        shoulder_result = calculate_shoulder_alignment(all_landmarks)
 
-        # ── 5. Score aggregation ──────────────────────────────────────────────
-        scores = [
-            batting_metrics.get("stanceScore", 70),
-            batting_metrics.get("headPositionScore", 70),
-            batting_metrics.get("timingScore", 70),
-            batting_metrics.get("followThroughScore", 70),
-        ]
-        overall = round(sum(scores) / len(scores))
+        # ── 5. Single-frame metrics (stance requires best-pose frame) ─────────
+        # Pick the frame with best overall landmark visibility
+        best_lm = max(valid, key=lambda lm: sum(
+            lm[k][3] for k in lm if isinstance(lm[k], list) and len(lm[k]) > 3
+        ))
+        stance_metrics = analyze_stance_from_single_frame(best_lm)
+
+        # ── 6. Shot classification from full sequence ─────────────────────────
+        shot_type = classify_shot(all_landmarks)
+
+        # ── 7. Compile all metrics ────────────────────────────────────────────
+        batting_metrics = {
+            # Temporal scores (from full sequence)
+            "headStabilityScore":  head_result["score"],
+            "headStabilityVariance": head_result["variance"],
+            "headStabilityNote":   head_result["note"],
+            "timingScore":         timing_result["score"],
+            "peakKneeFlexion":     timing_result["peakFlexion"],
+            "peakKneeExtension":   timing_result["peakExtension"],
+            "rangeOfMotion":       timing_result["rangeOfMotion"],
+            "timingNote":          timing_result["note"],
+            "balanceScore":        balance_result["score"],
+            "avgHipTilt":          balance_result["avgHipTilt"],
+            "avgSpineOffset":      balance_result["avgSpineOffset"],
+            "balanceNote":         balance_result["note"],
+            "strideScore":         stride_result["score"],
+            "avgStrideRatio":      stride_result["avgStrideRatio"],
+            "strideNote":          stride_result["note"],
+            "followThroughScore":  follow_result["score"],
+            "wristYDelta":         follow_result["wristYDelta"],
+            "followThroughNote":   follow_result["note"],
+            "shoulderAlignmentScore": shoulder_result["score"],
+            # Single-frame scores
+            "stanceScore":         stance_metrics.get("stanceScore", 50),
+            "batSwingAngle":       stance_metrics.get("batSwingAngle"),
+            "wristPositionScore":  stance_metrics.get("wristPositionScore", 50),
+            "wristNote":           stance_metrics.get("wristNote", ""),
+            # Classification
+            "shotType":            shot_type,
+        }
+
+        # ── 8. Deterministic overall score ────────────────────────────────────
+        overall = compute_overall_batting_score(batting_metrics)
         batting_metrics["overallBattingScore"] = overall
 
-        # ── 6. AI coaching report ─────────────────────────────────────────────
-        report = await generate_report(batting_metrics, "batting")
+        # ── 9. Fault detection (evidence-based) ──────────────────────────────
+        faults = detect_faults(batting_metrics, "batting")
+        fault_codes = [f["faultCode"] for f in faults]
 
+        # ── 10. LLM report (narration only — no score invention) ──────────────
+        report = await generate_report(batting_metrics, "batting", faults)
+
+        # ── 11. Build response with full audit trail ──────────────────────────
         return {
             "success": True,
             "type": "batting",
@@ -189,17 +230,39 @@ async def analyze_batting(
             "frames_analysed": len(frames),
             "frames_with_pose": len(valid),
             "batting_metrics": {
-                "stanceScore":        batting_metrics.get("stanceScore", 70),
-                "batSwingAngle":      batting_metrics.get("batSwingAngle", 45.0),
-                "headPosition":       batting_metrics.get("headPosition", ""),
-                "headPositionScore":  batting_metrics.get("headPositionScore", 70),
-                "timingScore":        batting_metrics.get("timingScore", 70),
-                "followThroughScore": batting_metrics.get("followThroughScore", 70),
-                "shotType":           batting_metrics.get("shotType", "Cover Drive"),
-                "overallBattingScore": overall,
+                # Temporal metrics (derived from full sequence)
+                "headStabilityScore":    batting_metrics["headStabilityScore"],
+                "headStabilityVariance": batting_metrics["headStabilityVariance"],
+                "headStabilityNote":     batting_metrics["headStabilityNote"],
+                "timingScore":           batting_metrics["timingScore"],
+                "peakKneeFlexion":       batting_metrics["peakKneeFlexion"],
+                "peakKneeExtension":     batting_metrics["peakKneeExtension"],
+                "rangeOfMotion":         batting_metrics["rangeOfMotion"],
+                "timingNote":            batting_metrics["timingNote"],
+                "balanceScore":          batting_metrics["balanceScore"],
+                "avgHipTilt":            batting_metrics["avgHipTilt"],
+                "balanceNote":           batting_metrics["balanceNote"],
+                "strideScore":           batting_metrics["strideScore"],
+                "avgStrideRatio":        batting_metrics["avgStrideRatio"],
+                "strideNote":            batting_metrics["strideNote"],
+                "followThroughScore":    batting_metrics["followThroughScore"],
+                "wristYDelta":           batting_metrics["wristYDelta"],
+                "followThroughNote":     batting_metrics["followThroughNote"],
+                # Single-frame metrics
+                "stanceScore":           batting_metrics["stanceScore"],
+                "batSwingAngle":         batting_metrics["batSwingAngle"],
+                "wristPositionScore":    batting_metrics["wristPositionScore"],
+                "wristNote":             batting_metrics["wristNote"],
+                "shoulderAlignmentScore": batting_metrics["shoulderAlignmentScore"],
+                # Classification
+                "shotType":              batting_metrics["shotType"],
+                "overallBattingScore":   overall,
             },
             "overall_score": overall,
-            "landmarks": mid_lm,
+            "faults": faults,
+            "fault_codes": fault_codes,
+            "raw_frame_metrics": extract_raw_frame_metrics(all_landmarks, "batting"),
+            "landmarks": best_lm,
             **report,
         }
 
