@@ -21,7 +21,7 @@ import httpx
 from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
-    validate_cricket_content_async,
+    validate_cricket_content_async, validate_video_locally,
     estimate_ball_speed, classify_ball_speed,
     # Deterministic scoring functions
     calculate_arm_smoothness,
@@ -126,13 +126,10 @@ async def analyze_bowling(
         if not frames:
             raise HTTPException(400, "Invalid video: could not extract frames.")
 
-        # ── 2. Cricket content validation ────────────────────────────────
-        mid_frame = frames[len(frames) // 2]
-        if not await validate_cricket_content_async(mid_frame):
-            raise HTTPException(
-                400,
-                "Content validation failed. Please upload a cricket bowling video."
-            )
+        # ── 2. Local verifiable validation pipeline ───────────────────────────
+        is_valid, err_msg = validate_video_locally(frames, "bowling")
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=err_msg)
 
         # ── 3. Ball speed via optical flow ────────────────────────────────
         # Returns None if ball not trackable — we report this honestly

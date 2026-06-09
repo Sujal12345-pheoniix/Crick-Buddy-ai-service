@@ -15,7 +15,7 @@ import httpx
 from utils.analysis import (
     analyze_pose_from_image, analyze_pose_from_video_frames, extract_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
-    validate_cricket_content_async,
+    validate_cricket_content_async, validate_video_locally,
     calculate_balance_score,
     calculate_shoulder_alignment,
     detect_faults,
@@ -133,11 +133,9 @@ async def analyze_posture(
             # Image path
             img = cv2.imread(tmp_path)
             if img is not None:
-                if not await validate_cricket_content_async(img):
-                    raise HTTPException(
-                        400,
-                        "Wrong file uploaded. Please upload a cricket posture image."
-                    )
+                is_valid, err_msg = validate_video_locally([img], "posture")
+                if not is_valid:
+                    raise HTTPException(status_code=400, detail=err_msg)
             landmarks = analyze_pose_from_image(tmp_path)
         else:
             # Video path
@@ -145,12 +143,9 @@ async def analyze_posture(
             if not frames:
                 raise HTTPException(400, "Invalid video: could not extract frames.")
 
-            mid_frame = frames[len(frames) // 2]
-            if not await validate_cricket_content_async(mid_frame):
-                raise HTTPException(
-                    400,
-                    "Content validation failed. Please upload a cricket posture video."
-                )
+            is_valid, err_msg = validate_video_locally(frames, "posture")
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=err_msg)
 
             all_lm = analyze_pose_from_video_frames(frames)
             valid = [lm for lm in all_lm if lm is not None]

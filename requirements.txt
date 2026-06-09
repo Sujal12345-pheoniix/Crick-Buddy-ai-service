@@ -10,7 +10,7 @@ numpy>=1.26.0,<2.0.0
 opencv-python-headless>=4.9.0.80
 
 # Pose estimation
-mediapipe==0.10.11
+mediapipe>=0.10.11
 
 # Object detection (CPU-only torch forced by build.sh)
 ultralytics>=8.2.0

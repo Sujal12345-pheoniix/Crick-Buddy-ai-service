@@ -21,7 +21,7 @@ import httpx
 from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
-    validate_cricket_content_async,
+    validate_cricket_content_async, validate_video_locally,
     # Deterministic scoring functions
     calculate_head_stability,
     calculate_timing_score,
@@ -143,13 +143,10 @@ async def analyze_batting(
         if not frames:
             raise HTTPException(400, "Invalid video: could not extract frames.")
 
-        # ── 2. Cricket content validation via Gemini Vision ───────────────────
-        mid_frame = frames[len(frames) // 2]
-        if not await validate_cricket_content_async(mid_frame):
-            raise HTTPException(
-                400,
-                "Content validation failed. Please upload a cricket batting video."
-            )
+        # ── 2. Local verifiable validation pipeline ───────────────────────────
+        is_valid, err_msg = validate_video_locally(frames, "batting")
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=err_msg)
 
         # ── 3. Multi-frame pose detection (YOLO→crop→MediaPipe) ──────────────
         all_landmarks = analyze_pose_from_video_frames(frames)

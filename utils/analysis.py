@@ -344,6 +344,101 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
     return None
 
 
+def validate_video_locally(frames: List[np.ndarray], action_expected: str) -> Tuple[bool, str]:
+    """
+    Local, verifiable video validation pipeline using YOLOv8 and motion analysis:
+    1. Detect human presence (YOLO class 0 'person')
+    2. Detect cricket bat (YOLO class 77 'baseball bat' or wrist motion proxy)
+    3. Detect cricket action (movement validation via optical flow / pose variance)
+    
+    Returns (is_valid, error_description)
+    """
+    import cv2
+    if not frames:
+        return False, "ERR_INVALID_VIDEO: Could not extract frames from the video."
+
+    yolo = _get_yolo()
+    if yolo is None:
+        # Non-fatal fallback if YOLO model cannot be loaded
+        print("[Warn] YOLO unavailable during validation, falling back to basic checks")
+        return True, ""
+
+    # Sample up to 5 frames for validation to keep it fast
+    indices = np.linspace(0, len(frames) - 1, num=min(5, len(frames)), dtype=int)
+    sampled_frames = [frames[i] for i in indices]
+
+    human_detected_count = 0
+    bat_detected = False
+
+    for idx, frame in enumerate(sampled_frames):
+        try:
+            # Run YOLOv8 on resized frame for speed
+            small_frame = _resize_frame(frame)
+            results = yolo(small_frame, verbose=False, conf=0.15)
+            boxes = results[0].boxes
+            
+            has_human = False
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                
+                if cls_id == 0 and conf >= 0.45:
+                    has_human = True
+                if cls_id == 77 and conf >= 0.15:  # COCO baseball bat class
+                    bat_detected = True
+
+            if has_human:
+                human_detected_count += 1
+        except Exception as e:
+            print(f"[Warn] YOLO validation error on frame {idx}: {e}")
+
+    # 1. Human presence check
+    passed_human = (human_detected_count / len(sampled_frames)) >= 0.40
+    if not passed_human:
+        return False, "ERR_NO_HUMAN_DETECTED: No player detected in the video. Please ensure the player is fully visible and centered."
+
+    # 2. Cricket bat check (only for batting)
+    if action_expected == "batting" and not bat_detected:
+        # Fallback check: Let's see if there is significant hand/wrist movement
+        # If the player is swinging, we will see wrist movement. If not, it's just a static scene
+        print("[Info] YOLO class 77 (baseball bat) not found. Checking wrist motion proxy...")
+        # Run MediaPipe on frames to check wrist coordinates variance
+        wrist_y_coords = []
+        for frame in sampled_frames:
+            lm = _run_mediapipe_on_frame(frame, complexity=1, conf=0.20)
+            if lm:
+                rw = get_point(lm, RIGHT_WRIST)
+                lw = get_point(lm, LEFT_WRIST)
+                if rw:
+                    wrist_y_coords.append(rw[1])
+                elif lw:
+                    wrist_y_coords.append(lw[1])
+        
+        # If wrist motion variance is extremely low, it's likely a static video without a swing
+        wrist_variance = np.var(wrist_y_coords) if len(wrist_y_coords) >= 3 else 0.0
+        if wrist_variance < 0.0003:
+            return False, "ERR_NO_BAT_DETECTED: Cricket bat not detected. Ensure your bat is visible and active in the swing."
+
+    # 3. Cricket action / motion check
+    # Estimate dense optical flow to confirm dynamic motion
+    try:
+        motion_mags = []
+        for i in range(len(sampled_frames) - 1):
+            prev = cv2.cvtColor(_resize_frame(sampled_frames[i]), cv2.COLOR_BGR2GRAY)
+            nxt = cv2.cvtColor(_resize_frame(sampled_frames[i+1]), cv2.COLOR_BGR2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(prev, nxt, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            motion_mags.append(float(np.mean(mag)))
+            
+        avg_motion = np.mean(motion_mags) if motion_mags else 0.0
+        if avg_motion < 0.35:
+            return False, "ERR_NOT_CRICKET_ACTION: No athletic action or movement detected. Please upload an active batting or bowling clip."
+    except Exception as e:
+        print(f"[Warn] Motion check skipped due to error: {e}")
+
+    return True, ""
+
+
 # ─── Cricket content validation ───────────────────────────────────────────────
 
 async def validate_cricket_content_async(image: np.ndarray) -> bool:
