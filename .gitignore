@@ -40,3 +40,8 @@ uploads/
 
 # Environment variables
 .env
+
+# Cricket Dataset and Caches
+[Dd]ataset/
+extracted_features.npz
+*.ipynb

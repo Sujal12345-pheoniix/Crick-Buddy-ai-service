@@ -52,55 +52,41 @@ def extract_fault_features(metrics: Dict[str, Any], action_type: str) -> np.ndar
 
 class FaultDetector:
     def __init__(self, model_path="fault_detector.pth"):
-        self.model = FaultMLP()
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        abs_model_path = os.path.join(base_dir, model_path)
-        if os.path.exists(abs_model_path):
-            try:
-                self.model.load_state_dict(torch.load(abs_model_path, map_location=torch.device('cpu')))
-                self.model.eval()
-                print(f"[Info] Fault Detector model loaded from {abs_model_path}")
-            except Exception as e:
-                print(f"[Warn] Failed to load Fault Detector: {e}")
-        else:
-            print(f"[Info] Fault Detector weights not found at {abs_model_path}. Using default initialization.")
+        print("[Info] Fault Detector initialized in deterministic rule-based mode.")
             
     def detect(self, metrics: Dict[str, Any], action_type: str) -> List[Dict[str, Any]]:
         """
-        Uses the MLP model to predict which faults are active.
+        Uses explicit, mathematically verifiable rules to detect biomechanical faults.
         Returns a list of structured faults.
         """
-        feat = extract_fault_features(metrics, action_type)
-        x = torch.tensor(feat)
+        # Read the metrics, using standard safe defaults if not computed
+        head_var = metrics.get("headStabilityVariance", 0.001) or 0.001
+        hip_tilt = metrics.get("avgHipTilt", 0.02) or 0.02
+        spine_offset = metrics.get("avgSpineOffset", 0.02) or 0.02
+        rom = metrics.get("rangeOfMotion", 45.0) or 45.0
+        wrist_delta = metrics.get("wristYDelta", 0.1) or 0.1
+        bat_angle = metrics.get("batSwingAngle", 45.0) or 45.0
         
-        with torch.no_grad():
-            probs = self.model(x).squeeze(0).numpy()
-            
-        fault_names = [
-            ("POOR_BALANCE", "poor balance", "avgHipTilt", 0.04, "moderate"),
-            ("HEAD_MOVEMENT", "head movement", "headStabilityVariance", 0.002, "moderate"),
-            ("STANCE_ISSUE", "stance issue", "batSwingAngle", 30.0, "minor"),
-            ("WEAK_FOLLOW_THROUGH", "weak follow-through", "wristYDelta", 0.05, "moderate"),
-            ("POOR_TIMING", "poor timing", "rangeOfMotion", 25.0, "moderate")
+        fault_rules = [
+            ("POOR_BALANCE", "poor balance", "avgHipTilt", hip_tilt, 0.05, hip_tilt > 0.05 or spine_offset > 0.05, "moderate"),
+            ("HEAD_MOVEMENT", "head movement", "headStabilityVariance", head_var, 0.003, head_var > 0.003, "moderate"),
+            ("STANCE_ISSUE", "stance issue", "batSwingAngle", bat_angle, 35.0, bat_angle < 35.0 or bat_angle > 75.0, "minor"),
+            ("WEAK_FOLLOW_THROUGH", "weak follow-through", "wristYDelta", wrist_delta, 0.05, wrist_delta < 0.05, "moderate"),
+            ("POOR_TIMING", "poor timing", "rangeOfMotion", rom, 25.0, rom < 25.0, "moderate")
         ]
         
         detected_faults = []
-        for i, prob in enumerate(probs):
-            # If probability is > 0.5, we flag it as an active fault
-            if prob > 0.5:
-                code, desc, metric_name, threshold, severity = fault_names[i]
-                
-                # Check for critical severity if metric is significantly off
-                val = metrics.get(metric_name)
-                if val is not None:
-                    if metric_name == "headStabilityVariance" and val > 0.005:
-                        severity = "critical"
-                    elif metric_name == "avgHipTilt" and val > 0.08:
-                        severity = "critical"
-                        
+        for code, desc, metric_name, val, threshold, is_active, severity in fault_rules:
+            if is_active:
+                # Upgrade severity if metric is critically off
+                if metric_name == "headStabilityVariance" and val > 0.005:
+                    severity = "critical"
+                elif metric_name == "avgHipTilt" and val > 0.08:
+                    severity = "critical"
+                    
                 detected_faults.append({
                     "faultCode": f"{code}_ML",
-                    "faultText": f"{desc.capitalize()} detected by analysis model.",
+                    "faultText": f"{desc.capitalize()} detected by kinematics engine.",
                     "metric": metric_name,
                     "value": round(float(val), 4) if val is not None else None,
                     "threshold": threshold,
@@ -108,3 +94,4 @@ class FaultDetector:
                 })
                 
         return detected_faults
+

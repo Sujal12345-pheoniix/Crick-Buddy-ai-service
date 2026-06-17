@@ -4,18 +4,101 @@ import torch.optim as optim
 import numpy as np
 import os
 import sys
+import cv2
 
 # Add directory to sys.path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from utils.video_validator import VideoValidatorNet
-from utils.action_classifier import ActionLSTM
+from utils.video_validator import VideoValidatorNet, extract_validation_features
+from utils.action_classifier import ActionLSTM, format_pose_sequence
 from utils.fault_detector import FaultMLP
+from utils.analysis import _get_yolo, extract_frames, analyze_pose_from_video_frames
 
-def generate_validator_dataset(num_samples=400):
+def get_dataset_dir():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in os.listdir(base_dir):
+        if name.lower() == "dataset":
+            return os.path.join(base_dir, name)
+    return None
+
+def extract_dataset_features():
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extracted_features.npz")
+    if os.path.exists(cache_path):
+        print(f"[Info] Found cached features at {cache_path}. Loading cached data...")
+        try:
+            data = np.load(cache_path, allow_pickle=True)
+            real_cricket_feats = list(data['validator_feats'])
+            real_bowling_seqs = list(data['action_seqs'])
+            print(f"[Success] Loaded {len(real_cricket_feats)} validator features and {len(real_bowling_seqs)} action sequences from cache.")
+            return real_cricket_feats, real_bowling_seqs
+        except Exception as e:
+            print(f"[Warn] Failed to load cache: {e}. Re-extracting...")
+
+    dataset_dir = get_dataset_dir()
+    if not dataset_dir:
+        print("[Warning] No 'Dataset' folder found. Falling back to 100% synthetic training.")
+        return [], []
+
+    print(f"[Info] Found dataset directory at: {dataset_dir}")
+    
+    # We will scan train and test directories recursively for all video files
+    video_paths = []
+    for root, dirs, files in os.walk(dataset_dir):
+        for file in files:
+            if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                video_paths.append(os.path.join(root, file))
+
+    print(f"[Info] Found {len(video_paths)} videos in dataset folder.")
+    
+    # Cap processed videos for speed, keeping a strong representation
+    max_videos = 30
+    if len(video_paths) > max_videos:
+        print(f"[Info] Sampling {max_videos} videos from the dataset for training feature extraction.")
+        np.random.seed(42)
+        video_paths = list(np.random.choice(video_paths, max_videos, replace=False))
+
+    yolo_model = _get_yolo()
+    
+    extracted_validator_features = []
+    extracted_action_sequences = []
+
+    for i, path in enumerate(video_paths):
+        print(f"[{i+1}/{len(video_paths)}] Processing: {os.path.basename(path)}")
+        try:
+            frames = extract_frames(path, num_frames=20)
+            if not frames or len(frames) < 3:
+                print(f"  -> Skipped (not enough frames or invalid video)")
+                continue
+
+            # 1. Validator Feature Extraction (Cricket)
+            val_feats = extract_validation_features(frames, yolo_model)
+            extracted_validator_features.append(val_feats[0])
+
+            # 2. Action Pose Sequence Extraction (Bowling)
+            all_landmarks = analyze_pose_from_video_frames(frames)
+            seq = format_pose_sequence(all_landmarks, max_seq_len=20)
+            extracted_action_sequences.append(seq[0])
+        except Exception as e:
+            print(f"  -> Error processing video {path}: {e}")
+
+    # Save to cache
+    try:
+        np.savez_compressed(
+            cache_path,
+            validator_feats=np.array(extracted_validator_features, dtype=np.float32),
+            action_seqs=np.array(extracted_action_sequences, dtype=np.float32)
+        )
+        print(f"[Success] Saved extracted features to cache at {cache_path}")
+    except Exception as e:
+        print(f"[Warn] Failed to save features to cache: {e}")
+
+    return extracted_validator_features, extracted_action_sequences
+
+def generate_validator_dataset(real_cricket_feats, num_samples=400):
     X = []
     y = []
-    # Non-Cricket (low motion or low human presence)
+    
+    # Generate Non-Cricket (low motion or low human presence)
     for _ in range(num_samples // 2):
         avg_motion = np.random.uniform(0.0, 0.2)
         max_motion = np.random.uniform(0.0, 0.4)
@@ -25,8 +108,16 @@ def generate_validator_dataset(num_samples=400):
         X.append([avg_motion, max_motion, human_ratio, avg_conf, motion_var])
         y.append(0)
         
-    # Cricket (high motion, high human presence/confidence)
-    for _ in range(num_samples // 2):
+    # Generate Cricket
+    num_synthetic_cricket = (num_samples // 2) - len(real_cricket_feats)
+    
+    # Add real extracted cricket features
+    for feat in real_cricket_feats:
+        X.append(feat)
+        y.append(1)
+
+    # Supplement with synthetic cricket samples to match target size
+    for _ in range(max(0, num_synthetic_cricket)):
         avg_motion = np.random.uniform(0.5, 2.5)
         max_motion = np.random.uniform(1.0, 5.0)
         human_ratio = np.random.uniform(0.7, 1.0)
@@ -37,45 +128,86 @@ def generate_validator_dataset(num_samples=400):
         
     return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
-def generate_action_dataset(num_samples=600, seq_len=20, input_dim=26):
+def generate_action_dataset(real_bowling_seqs, num_samples=600, seq_len=20, input_dim=26):
     """
     Generate highly distinct trajectories for each action class:
       0: batting
-      1: bowling
+      1: bowling (uses real user dataset)
       2: fielding
       3: invalid
     """
     X = []
     y = []
     
-    for _ in range(num_samples):
-        cls = np.random.choice([0, 1, 2, 3])
+    # Let's count how many samples per class we need
+    samples_per_class = num_samples // 4
+
+    # Class 0: Batting (Synthetic)
+    for _ in range(samples_per_class):
         seq = []
         for t in range(seq_len):
             feat = [0.0] * 13
-            if cls == 0:  # Batting: wrist X travels left-to-right, knees bent
-                feat[0] = 0.5 # Nose
-                feat[5] = 0.3 + 0.4 * (t / seq_len) # Wrist X
-                feat[9] = 130.0 / 180.0 # Knee angle normalized
-            elif cls == 1:  # Bowling: wrist Y goes high-to-low (0.8 to 0.1)
-                feat[0] = 0.5
-                feat[6] = 0.8 - 0.7 * (t / seq_len) # Wrist Y
-                feat[9] = 170.0 / 180.0
-            elif cls == 2:  # Fielding: hips and shoulders low and static
-                feat[0] = 0.5
-                feat[7] = 0.7 # Hip Y
-                feat[9] = 110.0 / 180.0
-            else:  # Invalid: zeroed out or random noise
-                feat = list(np.random.uniform(-1.0, 1.0, 13))
+            feat[0] = 0.5 # Nose
+            feat[5] = 0.3 + 0.4 * (t / seq_len) # Wrist X
+            feat[9] = 130.0 / 180.0 # Knee angle normalized
             
-            # Map 13 landmarks to 26 coordinate features
             frame_feats = []
             for val in feat:
                 frame_feats.extend([val, val * 0.9])
             seq.append(frame_feats)
-            
         X.append(seq)
-        y.append(cls)
+        y.append(0)
+
+    # Class 1: Bowling (Real + Synthesized)
+    # Add real bowling samples
+    for seq in real_bowling_seqs:
+        X.append(seq)
+        y.append(1)
+        
+    # Supplement with synthetic bowling to ensure balanced classes
+    num_synthetic_bowling = samples_per_class - len(real_bowling_seqs)
+    for _ in range(max(0, num_synthetic_bowling)):
+        seq = []
+        for t in range(seq_len):
+            feat = [0.0] * 13
+            feat[0] = 0.5
+            feat[6] = 0.8 - 0.7 * (t / seq_len) # Wrist Y
+            feat[9] = 170.0 / 180.0
+            
+            frame_feats = []
+            for val in feat:
+                frame_feats.extend([val, val * 0.9])
+            seq.append(frame_feats)
+        X.append(seq)
+        y.append(1)
+
+    # Class 2: Fielding (Synthetic)
+    for _ in range(samples_per_class):
+        seq = []
+        for t in range(seq_len):
+            feat = [0.0] * 13
+            feat[0] = 0.5
+            feat[7] = 0.7 # Hip Y
+            feat[9] = 110.0 / 180.0
+            
+            frame_feats = []
+            for val in feat:
+                frame_feats.extend([val, val * 0.9])
+            seq.append(frame_feats)
+        X.append(seq)
+        y.append(2)
+
+    # Class 3: Invalid (Synthetic)
+    for _ in range(samples_per_class):
+        seq = []
+        for t in range(seq_len):
+            feat = list(np.random.uniform(-1.0, 1.0, 13))
+            frame_feats = []
+            for val in feat:
+                frame_feats.extend([val, val * 0.9])
+            seq.append(frame_feats)
+        X.append(seq)
+        y.append(3)
         
     return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
@@ -140,9 +272,20 @@ def train_and_eval(model, train_loader, val_loader, criterion, optimizer, epochs
 def main():
     print("[Start] Starting local model training and benchmarking pipeline...")
     
+    # 0. Extract features from user-provided dataset if exists (or loads from cache)
+    real_cricket_feats, real_bowling_seqs = extract_dataset_features()
+    
     # 1. Video Validator Model
     print("\n--- Training Video Validator ---")
-    val_X, val_y = generate_validator_dataset()
+    val_X, val_y = generate_validator_dataset(real_cricket_feats)
+    
+    # Shuffle dataset before split
+    np.random.seed(42)
+    indices = np.arange(len(val_X))
+    np.random.shuffle(indices)
+    val_X = val_X[indices]
+    val_y = val_y[indices]
+    
     train_size = int(0.8 * len(val_X))
     train_dataset = torch.utils.data.TensorDataset(val_X[:train_size], val_y[:train_size])
     val_dataset = torch.utils.data.TensorDataset(val_X[train_size:], val_y[train_size:])
@@ -161,7 +304,14 @@ def main():
     
     # 2. Action Classifier LSTM Model
     print("\n--- Training Action Classifier (LSTM) ---")
-    act_X, act_y = generate_action_dataset()
+    act_X, act_y = generate_action_dataset(real_bowling_seqs)
+    
+    # Shuffle dataset before split
+    indices = np.arange(len(act_X))
+    np.random.shuffle(indices)
+    act_X = act_X[indices]
+    act_y = act_y[indices]
+    
     train_size = int(0.8 * len(act_X))
     train_dataset = torch.utils.data.TensorDataset(act_X[:train_size], act_y[:train_size])
     val_dataset = torch.utils.data.TensorDataset(act_X[train_size:], act_y[train_size:])
@@ -187,6 +337,13 @@ def main():
     # 3. Fault Detector MLP Model
     print("\n--- Training Fault Detector ---")
     flt_X, flt_y = generate_fault_dataset()
+    
+    # Shuffle dataset before split
+    indices = np.arange(len(flt_X))
+    np.random.shuffle(indices)
+    flt_X = flt_X[indices]
+    flt_y = flt_y[indices]
+    
     train_size = int(0.8 * len(flt_X))
     train_dataset = torch.utils.data.TensorDataset(flt_X[:train_size], flt_y[:train_size])
     val_dataset = torch.utils.data.TensorDataset(flt_X[train_size:], flt_y[train_size:])

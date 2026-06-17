@@ -72,42 +72,28 @@ def extract_validation_features(frames, yolo_model=None) -> np.ndarray:
 class VideoValidator:
     def __init__(self, model_path="video_validator.pth", yolo_model=None):
         self.yolo_model = yolo_model
-        self.model = VideoValidatorNet()
-        # Find absolute path if loaded in FastAPI
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        abs_model_path = os.path.join(base_dir, model_path)
-        if os.path.exists(abs_model_path):
-            try:
-                self.model.load_state_dict(torch.load(abs_model_path, map_location=torch.device('cpu')))
-                self.model.eval()
-                print(f"[Info] Video Validator model loaded from {abs_model_path}")
-            except Exception as e:
-                print(f"[Warn] Failed to load Video Validator: {e}")
-        else:
-            print(f"[Info] Video Validator weights not found at {abs_model_path}. Using default initialization.")
+        print("[Info] Video Validator initialized in deterministic rule-based mode.")
             
     def validate(self, frames) -> tuple[bool, str]:
         """
-        Classifies the video as Cricket or Non-Cricket.
+        Classifies the video as Cricket or Non-Cricket based on human detection
+        and optical flow motion signatures.
         Returns (is_valid, message)
         """
         if not frames or len(frames) < 3:
             return False, "ERR_INVALID_VIDEO: Could not extract enough frames from the video."
             
         features = extract_validation_features(frames, self.yolo_model)
-        x = torch.tensor(features)
+        avg_motion, max_motion, human_ratio, avg_conf, motion_var = features[0]
         
-        with torch.no_grad():
-            outputs = self.model(x)
-            prediction = torch.argmax(outputs, dim=1).item()
+        # Rule-based cricket check:
+        # 1. Require a human player visible in at least 40% of frames
+        if human_ratio < 0.4:
+            return False, "ERR_NO_HUMAN_DETECTED: No player detected in the video."
             
-        # If prediction is 1, it's Cricket. Otherwise Non-Cricket.
-        if prediction == 1:
-            return True, ""
-        else:
-            # Check if there is zero motion or no human to provide a detailed message
-            if features[0, 2] < 0.2:
-                return False, "ERR_NO_HUMAN_DETECTED: No player detected in the video."
-            if features[0, 0] < 0.1:
-                return False, "ERR_NOT_CRICKET_ACTION: No athletic action or movement detected."
-            return False, "ERR_NON_CRICKET: The uploaded video does not contain valid cricket movements."
+        # 2. Require minimum physical motion (cricket action involves swing or movement)
+        if avg_motion < 0.15 and max_motion < 0.3:
+            return False, "ERR_NOT_CRICKET_ACTION: No athletic action or movement detected."
+            
+        return True, ""
+

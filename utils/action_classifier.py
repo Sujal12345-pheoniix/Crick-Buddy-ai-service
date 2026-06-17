@@ -66,30 +66,55 @@ def format_pose_sequence(all_landmarks, max_seq_len=20) -> np.ndarray:
 
 class ActionClassifier:
     def __init__(self, model_path="action_classifier.pth"):
-        self.model = ActionLSTM()
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        abs_model_path = os.path.join(base_dir, model_path)
-        if os.path.exists(abs_model_path):
-            try:
-                self.model.load_state_dict(torch.load(abs_model_path, map_location=torch.device('cpu')))
-                self.model.eval()
-                print(f"[Info] Action Classifier model loaded from {abs_model_path}")
-            except Exception as e:
-                print(f"[Warn] Failed to load Action Classifier: {e}")
-        else:
-            print(f"[Info] Action Classifier weights not found at {abs_model_path}. Using default initialization.")
+        print("[Info] Action Classifier initialized in deterministic trajectory-based mode.")
             
     def predict(self, all_landmarks) -> str:
         """
-        Predicts the action class from a pose sequence.
+        Predicts the action class from a pose sequence using deterministic joint trajectory rules.
         Returns one of: 'batting', 'bowling', 'fielding', 'invalid'
         """
-        seq = format_pose_sequence(all_landmarks)
-        x = torch.tensor(seq)
+        # Filter valid frames
+        valid_lms = [lm for lm in all_landmarks if lm is not None]
+        if len(valid_lms) < 3:
+            return "invalid"
+
+        # Landmark IDs:
+        # RIGHT_WRIST = 16, LEFT_WRIST = 15
+        # RIGHT_SHOULDER = 12, LEFT_SHOULDER = 11
+        rw_ys = [lm[16][1] for lm in valid_lms if 16 in lm]
+        lw_ys = [lm[15][1] for lm in valid_lms if 15 in lm]
+        rw_xs = [lm[16][0] for lm in valid_lms if 16 in lm]
+        lw_xs = [lm[15][0] for lm in valid_lms if 15 in lm]
         
-        with torch.no_grad():
-            outputs = self.model(x)
-            pred_idx = torch.argmax(outputs, dim=1).item()
-            
-        classes = ['batting', 'bowling', 'fielding', 'invalid']
-        return classes[pred_idx]
+        rs_ys = [lm[12][1] for lm in valid_lms if 12 in lm]
+        ls_ys = [lm[11][1] for lm in valid_lms if 11 in lm]
+
+        # Calculate coordinates displacement ranges
+        rw_range_y = max(rw_ys) - min(rw_ys) if rw_ys else 0
+        lw_range_y = max(lw_ys) - min(lw_ys) if lw_ys else 0
+        rw_range_x = max(rw_xs) - min(rw_xs) if rw_xs else 0
+        lw_range_x = max(lw_xs) - min(lw_xs) if lw_xs else 0
+        
+        max_range_y = max(rw_range_y, lw_range_y)
+        max_range_x = max(rw_range_x, lw_range_x)
+
+        # Check if wrist reaches high above shoulder (release point check for bowling)
+        # Note: Y goes from 0 (top of image) to 1 (bottom of image)
+        rw_above_shoulder = any(rw_y < rs_y for rw_y, rs_y in zip(rw_ys, rs_ys)) if (rw_ys and rs_ys) else False
+        lw_above_shoulder = any(lw_y < ls_y for lw_y, ls_y in zip(lw_ys, ls_ys)) if (lw_ys and ls_ys) else False
+        reaches_high = rw_above_shoulder or lw_above_shoulder
+
+        # Deterministic classification rules:
+        # 1. Bowling: Large vertical range of motion, wrist goes above shoulder height
+        if max_range_y > 0.32 and reaches_high:
+            return "bowling"
+        # 2. Batting: Significant horizontal motion, wrist remains mostly below shoulder height
+        elif max_range_x > 0.15:
+            return "batting"
+        # 3. Static/Unmoving: Extremely low motion
+        elif max_range_x < 0.05 and max_range_y < 0.05:
+            return "invalid"
+        # 4. Fallback: Moderate motion / default to fielding
+        else:
+            return "fielding"
+
