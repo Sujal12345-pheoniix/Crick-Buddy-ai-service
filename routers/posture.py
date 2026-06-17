@@ -150,11 +150,22 @@ async def analyze_posture(
             all_lm = analyze_pose_from_video_frames(frames)
             valid = [lm for lm in all_lm if lm is not None]
             if valid:
+                # Check that action is not invalid
+                from utils.analysis import get_action_classifier
+                classifier = get_action_classifier()
+                action_class = classifier.predict(all_lm)
+                if action_class == "invalid":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="ERR_INVALID_ACTION: Uploaded video does not show valid cricket action or posture."
+                    )
+
                 # Use best-visibility frame as primary, but run temporal where possible
                 landmarks = max(valid, key=lambda lm: sum(
                     lm[k][3] for k in lm if isinstance(lm[k], list) and len(lm[k]) > 3
                 ))
                 all_landmarks_list = all_lm
+
 
         if landmarks is None:
             raise HTTPException(

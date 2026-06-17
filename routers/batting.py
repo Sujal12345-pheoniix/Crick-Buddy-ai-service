@@ -159,6 +159,17 @@ async def analyze_batting(
                 "visible, well-lit, and in the centre of the frame."
             )
 
+        # Run action classifier
+        from utils.analysis import get_action_classifier
+        classifier = get_action_classifier()
+        action_class = classifier.predict(all_landmarks)
+        if action_class != "batting":
+            raise HTTPException(
+                status_code=400,
+                detail=f"ERR_INVALID_ACTION: Expected batting video, but action classifier detected: {action_class}."
+            )
+
+
         # ── 4. TEMPORAL ANALYSIS — uses ALL frames, not just one ──────────────
         head_result    = calculate_head_stability(all_landmarks)
         timing_result  = calculate_timing_score(all_landmarks)

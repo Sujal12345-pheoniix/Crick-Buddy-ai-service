@@ -36,6 +36,14 @@ LEFT_ANKLE = 27;     RIGHT_ANKLE = 28
 _yolo_model = None
 _mp_pose_c1 = None
 _mp_pose_c2 = None
+_video_validator = None
+_action_classifier = None
+_fault_detector = None
+
+
+from utils.video_validator import VideoValidator
+from utils.action_classifier import ActionClassifier
+from utils.fault_detector import FaultDetector
 
 
 def _get_yolo():
@@ -53,13 +61,41 @@ def _get_yolo():
     return _yolo_model if _yolo_model else None
 
 
+def get_video_validator():
+    global _video_validator
+    if _video_validator is None:
+        _video_validator = VideoValidator(yolo_model=_get_yolo())
+    return _video_validator
+
+
+def get_action_classifier():
+    global _action_classifier
+    if _action_classifier is None:
+        _action_classifier = ActionClassifier()
+    return _action_classifier
+
+
+def get_fault_detector():
+    global _fault_detector
+    if _fault_detector is None:
+        _fault_detector = FaultDetector()
+    return _fault_detector
+
+
 def _get_mp_pose(complexity: int = 1):
     global _mp_pose_c1, _mp_pose_c2
-    import mediapipe as mp
+    try:
+        import mediapipe.solutions.pose as mp_pose
+    except ModuleNotFoundError:
+        try:
+            import mediapipe.python.solutions.pose as mp_pose
+        except ModuleNotFoundError as e:
+            print(f"[Error] Critical MediaPipe import failed: {e}")
+            raise e
 
     if complexity == 1:
         if _mp_pose_c1 is None:
-            _mp_pose_c1 = mp.solutions.pose.Pose(
+            _mp_pose_c1 = mp_pose.Pose(
                 static_image_mode=True,
                 model_complexity=1,
                 enable_segmentation=False,
@@ -70,7 +106,7 @@ def _get_mp_pose(complexity: int = 1):
         return _mp_pose_c1
     else:
         if _mp_pose_c2 is None:
-            _mp_pose_c2 = mp.solutions.pose.Pose(
+            _mp_pose_c2 = mp_pose.Pose(
                 static_image_mode=True,
                 model_complexity=2,
                 enable_segmentation=False,
@@ -79,6 +115,8 @@ def _get_mp_pose(complexity: int = 1):
             )
             print("[Info] MediaPipe Pose (complexity=2) singleton ready")
         return _mp_pose_c2
+
+
 
 
 def warmup_models():
@@ -101,7 +139,16 @@ def warmup_models():
     except Exception as e:
         print(f"[Warn] MediaPipe Pose warm-up error (non-fatal): {e}")
 
+    try:
+        get_video_validator()
+        get_action_classifier()
+        get_fault_detector()
+        print("[Info] ML pipeline models loaded and warmed up")
+    except Exception as e:
+        print(f"[Warn] ML models warm-up error: {e}")
+
     print("[Ready] All models ready — service is hot")
+
 
 
 # ─── Basic helpers ────────────────────────────────────────────────────────────
@@ -213,19 +260,39 @@ def extract_frames(video_path: str, num_frames: int = 20) -> List[np.ndarray]:
 
 # ─── YOLO player crop ─────────────────────────────────────────────────────────
 
-def _yolo_crop_person(frame: np.ndarray, pad: float = 0.15) -> Optional[Tuple[np.ndarray, Tuple]]:
+def _yolo_crop_person(frame: np.ndarray, pad: float = 0.15) -> Optional[Tuple[np.ndarray, Tuple, dict]]:
     model = _get_yolo()
     if model is None:
         return None
     try:
-        results = model(frame, verbose=False, conf=0.25, classes=[0])
+        # Detect person (0), sports ball (32), baseball bat (77)
+        results = model(frame, verbose=False, conf=0.15, classes=[0, 32, 77])
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return None
 
-        best_idx = int(boxes.conf.argmax())
-        x1, y1, x2, y2 = [float(v) for v in boxes.xyxy[best_idx]]
+        person_box = None
+        best_conf = 0.0
+        detections = {"bat": None, "ball": None}
 
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            xyxy = [float(v) for v in box.xyxy[0]]
+
+            if cls_id == 0:
+                if conf > best_conf:
+                    best_conf = conf
+                    person_box = xyxy
+            elif cls_id == 77:
+                detections["bat"] = xyxy
+            elif cls_id == 32:
+                detections["ball"] = xyxy
+
+        if person_box is None:
+            return None
+
+        x1, y1, x2, y2 = person_box
         h, w = frame.shape[:2]
         bw, bh = x2 - x1, y2 - y1
         px, py = bw * pad, bh * pad
@@ -239,7 +306,7 @@ def _yolo_crop_person(frame: np.ndarray, pad: float = 0.15) -> Optional[Tuple[np
             return None
 
         crop = frame[cy1:cy2, cx1:cx2]
-        return crop, (cx1, cy1, cx2, cy2)
+        return crop, (cx1, cy1, cx2, cy2), detections
 
     except Exception as e:
         print(f"YOLO crop error: {e}")
@@ -258,8 +325,9 @@ def _run_mediapipe_on_frame(
     frame_bgr = _resize_frame(frame_bgr)
 
     crop_result = _yolo_crop_person(frame_bgr)
+    detections = {"bat": None, "ball": None}
     if crop_result is not None:
-        crop_frame, (cx1, cy1, cx2, cy2) = crop_result
+        crop_frame, (cx1, cy1, cx2, cy2), detections = crop_result
         input_frame = crop_frame
     else:
         input_frame = frame_bgr
@@ -290,11 +358,21 @@ def _run_mediapipe_on_frame(
 
             landmarks[idx] = [round(nx, 4), round(ny, 4),
                                round(lm.z, 4), round(lm.visibility, 4)]
+
+        # Store bat and ball detections if found
+        if detections.get("bat") is not None:
+            landmarks["bat"] = [round(detections["bat"][0] / full_w, 4), round(detections["bat"][1] / full_h, 4),
+                                round(detections["bat"][2] / full_w, 4), round(detections["bat"][3] / full_h, 4)]
+        if detections.get("ball") is not None:
+            landmarks["ball"] = [round(detections["ball"][0] / full_w, 4), round(detections["ball"][1] / full_h, 4),
+                                 round(detections["ball"][2] / full_w, 4), round(detections["ball"][3] / full_h, 4)]
+
         return landmarks
 
     except Exception as e:
         print(f"MediaPipe inference error: {e}")
         return None
+
 
 
 def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[dict]]:
@@ -346,97 +424,16 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
 
 def validate_video_locally(frames: List[np.ndarray], action_expected: str) -> Tuple[bool, str]:
     """
-    Local, verifiable video validation pipeline using YOLOv8 and motion analysis:
-    1. Detect human presence (YOLO class 0 'person')
-    2. Detect cricket bat (YOLO class 77 'baseball bat' or wrist motion proxy)
-    3. Detect cricket action (movement validation via optical flow / pose variance)
-    
+    Local, verifiable video validation pipeline using the trained PyTorch Video Validator:
     Returns (is_valid, error_description)
     """
-    import cv2
     if not frames:
         return False, "ERR_INVALID_VIDEO: Could not extract frames from the video."
 
-    yolo = _get_yolo()
-    if yolo is None:
-        # Non-fatal fallback if YOLO model cannot be loaded
-        print("[Warn] YOLO unavailable during validation, falling back to basic checks")
-        return True, ""
+    validator = get_video_validator()
+    is_valid, err_msg = validator.validate(frames)
+    return is_valid, err_msg
 
-    # Sample up to 5 frames for validation to keep it fast
-    indices = np.linspace(0, len(frames) - 1, num=min(5, len(frames)), dtype=int)
-    sampled_frames = [frames[i] for i in indices]
-
-    human_detected_count = 0
-    bat_detected = False
-
-    for idx, frame in enumerate(sampled_frames):
-        try:
-            # Run YOLOv8 on resized frame for speed
-            small_frame = _resize_frame(frame)
-            results = yolo(small_frame, verbose=False, conf=0.15)
-            boxes = results[0].boxes
-            
-            has_human = False
-            for box in boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                
-                if cls_id == 0 and conf >= 0.45:
-                    has_human = True
-                if cls_id == 77 and conf >= 0.15:  # COCO baseball bat class
-                    bat_detected = True
-
-            if has_human:
-                human_detected_count += 1
-        except Exception as e:
-            print(f"[Warn] YOLO validation error on frame {idx}: {e}")
-
-    # 1. Human presence check
-    passed_human = (human_detected_count / len(sampled_frames)) >= 0.40
-    if not passed_human:
-        return False, "ERR_NO_HUMAN_DETECTED: No player detected in the video. Please ensure the player is fully visible and centered."
-
-    # 2. Cricket bat check (only for batting)
-    if action_expected == "batting" and not bat_detected:
-        # Fallback check: Let's see if there is significant hand/wrist movement
-        # If the player is swinging, we will see wrist movement. If not, it's just a static scene
-        print("[Info] YOLO class 77 (baseball bat) not found. Checking wrist motion proxy...")
-        # Run MediaPipe on frames to check wrist coordinates variance
-        wrist_y_coords = []
-        for frame in sampled_frames:
-            lm = _run_mediapipe_on_frame(frame, complexity=1, conf=0.20)
-            if lm:
-                rw = get_point(lm, RIGHT_WRIST)
-                lw = get_point(lm, LEFT_WRIST)
-                if rw:
-                    wrist_y_coords.append(rw[1])
-                elif lw:
-                    wrist_y_coords.append(lw[1])
-        
-        # If wrist motion variance is extremely low, it's likely a static video without a swing
-        wrist_variance = np.var(wrist_y_coords) if len(wrist_y_coords) >= 3 else 0.0
-        if wrist_variance < 0.0003:
-            return False, "ERR_NO_BAT_DETECTED: Cricket bat not detected. Ensure your bat is visible and active in the swing."
-
-    # 3. Cricket action / motion check
-    # Estimate dense optical flow to confirm dynamic motion
-    try:
-        motion_mags = []
-        for i in range(len(sampled_frames) - 1):
-            prev = cv2.cvtColor(_resize_frame(sampled_frames[i]), cv2.COLOR_BGR2GRAY)
-            nxt = cv2.cvtColor(_resize_frame(sampled_frames[i+1]), cv2.COLOR_BGR2GRAY)
-            flow = cv2.calcOpticalFlowFarneback(prev, nxt, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-            mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            motion_mags.append(float(np.mean(mag)))
-            
-        avg_motion = np.mean(motion_mags) if motion_mags else 0.0
-        if avg_motion < 0.35:
-            return False, "ERR_NOT_CRICKET_ACTION: No athletic action or movement detected. Please upload an active batting or bowling clip."
-    except Exception as e:
-        print(f"[Warn] Motion check skipped due to error: {e}")
-
-    return True, ""
 
 
 # ─── Cricket content validation ───────────────────────────────────────────────
@@ -922,86 +919,11 @@ def calculate_shoulder_alignment(frames: List[Optional[dict]]) -> Dict[str, Any]
 
 def detect_faults(metrics: Dict[str, Any], action_type: str) -> List[Dict[str, Any]]:
     """
-    Deterministic fault detection. Every fault is stored with:
-    - faultCode: machine-readable identifier
-    - faultText: human-readable description  
-    - metric: which metric triggered this
-    - value: actual measured value
-    - threshold: the threshold that was violated
-    - severity: critical | moderate | minor
+    Multilabel Fault detection using the trained PyTorch MLP model.
     """
-    faults = []
+    detector = get_fault_detector()
+    return detector.detect(metrics, action_type)
 
-    def add_fault(code, text, metric, value, threshold, severity):
-        faults.append({
-            "faultCode": code,
-            "faultText": text,
-            "metric": metric,
-            "value": round(float(value), 4) if value is not None else None,
-            "threshold": threshold,
-            "severity": severity
-        })
-
-    head_score = metrics.get("headStabilityScore", 100)
-    if head_score < 40:
-        add_fault("HEAD_INSTABILITY_CRITICAL", "Severe head movement — ball tracking compromised",
-                  "headStabilityScore", head_score, 40, "critical")
-    elif head_score < 65:
-        add_fault("HEAD_INSTABILITY", "Noticeable head movement during shot execution",
-                  "headStabilityScore", head_score, 65, "moderate")
-
-    balance_score = metrics.get("balanceScore", 100)
-    if balance_score < 40:
-        add_fault("POOR_BALANCE_CRITICAL", "Severe balance issue — significant injury risk",
-                  "balanceScore", balance_score, 40, "critical")
-    elif balance_score < 60:
-        add_fault("POOR_BALANCE", "Unstable base — hip tilt or spine misalignment detected",
-                  "balanceScore", balance_score, 60, "moderate")
-
-    if action_type == "batting":
-        timing_score = metrics.get("timingScore", 100)
-        if timing_score < 45:
-            add_fault("LATE_TIMING_CRITICAL", "Very late shot execution — bat not through at impact",
-                      "timingScore", timing_score, 45, "critical")
-        elif timing_score < 65:
-            add_fault("LATE_TIMING", "Late shot timing — weight transfer incomplete at impact",
-                      "timingScore", timing_score, 65, "moderate")
-
-        follow_score = metrics.get("followThroughScore", 100)
-        if follow_score < 40:
-            add_fault("NO_FOLLOW_THROUGH", "Follow-through absent — bat stopping at contact",
-                      "followThroughScore", follow_score, 40, "critical")
-        elif follow_score < 60:
-            add_fault("SHORT_FOLLOW_THROUGH", "Abbreviated follow-through reducing shot power",
-                      "followThroughScore", follow_score, 60, "moderate")
-
-        stride_score = metrics.get("strideScore", 100)
-        avg_stride = metrics.get("avgStrideRatio", 2.0)
-        if avg_stride is not None and avg_stride > 3.2:
-            add_fault("WIDE_STANCE", f"Overwide stance ({avg_stride:.2f}× hip width) — loss of mobility",
-                      "avgStrideRatio", avg_stride, 3.2, "minor")
-        elif avg_stride is not None and avg_stride < 0.8:
-            add_fault("NARROW_STANCE", f"Too narrow stance ({avg_stride:.2f}× hip width) — limited power base",
-                      "avgStrideRatio", avg_stride, 0.8, "minor")
-
-    elif action_type == "bowling":
-        arm_score = metrics.get("armSmoothnessScore", 100)
-        if arm_score < 40:
-            add_fault("JERKY_ACTION_CRITICAL", "Very inconsistent arm rotation — severe rhythm issue",
-                      "armSmoothnessScore", arm_score, 40, "critical")
-        elif arm_score < 60:
-            add_fault("JERKY_ACTION", "Inconsistent arm rotation speed — affects line and length",
-                      "armSmoothnessScore", arm_score, 60, "moderate")
-
-        release_score = metrics.get("releasePointScore", 100)
-        if release_score < 40:
-            add_fault("LOW_RELEASE_CRITICAL", "Very low release point — ball will lack pace and bounce",
-                      "releasePointScore", release_score, 40, "critical")
-        elif release_score < 60:
-            add_fault("LOW_RELEASE", "Below-ideal release height — losing bounce extraction",
-                      "releasePointScore", release_score, 60, "moderate")
-
-    return faults
 
 
 def compute_overall_batting_score(metrics: Dict[str, Any]) -> int:

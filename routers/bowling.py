@@ -152,6 +152,17 @@ async def analyze_bowling(
                 "visible, well-lit, and in the centre of the frame."
             )
 
+        # Run action classifier
+        from utils.analysis import get_action_classifier
+        classifier = get_action_classifier()
+        action_class = classifier.predict(all_landmarks)
+        if action_class != "bowling":
+            raise HTTPException(
+                status_code=400,
+                detail=f"ERR_INVALID_ACTION: Expected bowling video, but action classifier detected: {action_class}."
+            )
+
+
         # ── 5. TEMPORAL ANALYSIS — uses ALL frames ──────────────────────────
         arm_result     = calculate_arm_smoothness(all_landmarks, RIGHT_WRIST)
         release_result = calculate_release_point_score(all_landmarks)
