@@ -18,6 +18,8 @@ from typing import Optional
 
 import httpx
 
+from utils.remote_file import validate_file_url
+
 from utils.analysis import (
     extract_frames, analyze_pose_from_video_frames,
     calculate_angle, score_angle, generate_report, clamp_score,
@@ -120,6 +122,8 @@ async def analyze_batting(
 ):
     if not file and not fileUrl:
         raise HTTPException(400, "No file or fileUrl provided")
+    if not file:
+        validate_file_url(fileUrl)
 
     suffix = ".mp4"
     if file and file.filename:

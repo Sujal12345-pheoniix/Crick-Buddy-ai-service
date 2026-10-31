@@ -11,6 +11,7 @@ Start-up sequence:
 """
 
 import os
+import hmac
 import asyncio
 import concurrent.futures
 
@@ -55,6 +56,33 @@ async def timeout_middleware(request: Request, call_next):
                 ),
             },
         )
+
+
+# ─── Internal Auth Middleware ─────────────────────────────────────────────────
+# Only the backend may call analysis/chat endpoints. It must send the shared
+# secret from AI_SERVICE_SECRET in the X-Internal-Secret header.
+AI_SERVICE_SECRET = os.getenv("AI_SERVICE_SECRET", "").strip()
+PUBLIC_PATHS = {"/", "/health"}
+
+if not AI_SERVICE_SECRET:
+    print("[Warn] AI_SERVICE_SECRET is not set — all endpoints are publicly callable. "
+          "Set it here and in the backend env to require authentication.")
+
+
+@app.middleware("http")
+async def internal_auth_middleware(request: Request, call_next):
+    if (
+        AI_SERVICE_SECRET
+        and request.method != "OPTIONS"
+        and request.url.path not in PUBLIC_PATHS
+    ):
+        provided = request.headers.get("x-internal-secret", "")
+        if not hmac.compare_digest(provided.encode(), AI_SERVICE_SECRET.encode()):
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "detail": "Unauthorized"},
+            )
+    return await call_next(request)
 
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
