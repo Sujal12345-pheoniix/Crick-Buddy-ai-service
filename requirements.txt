@@ -10,7 +10,9 @@ numpy>=1.26.0,<2.0.0
 opencv-python-headless>=4.9.0.80
 
 # Pose estimation
-mediapipe>=0.10.11
+# Pinned: mediapipe 0.10.30+ and 1.x removed the legacy
+# mediapipe.solutions.pose API this service uses
+mediapipe==0.10.21
 
 # Object detection (CPU-only torch forced by build.sh)
 ultralytics>=8.2.0

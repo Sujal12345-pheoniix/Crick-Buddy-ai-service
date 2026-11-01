@@ -1,25 +1,27 @@
 """
-CrickBuddy AI Service — Deterministic Scoring Engine
-=====================================================
-All scores are computed from real pose landmarks.
-No random numbers. No hardcoded fallbacks.
-Every score is traceable to a formula and a measured value.
+CrickBuddy AI Service — shared vision primitives and report generation
+======================================================================
+This module holds the pieces every analysis type shares:
 
-Pipeline per frame:
-  1. Blur filter → skip low-quality frames
-  2. Resize → 640×480 for stable MediaPipe input  
-  3. YOLOv8 → detect person (class 0); crop + pad bounding box
-  4. MediaPipe → pose on cropped region
-  5. Landmark re-projection back to full-frame coordinates
+  * model singletons (YOLOv8n person/ball detector, MediaPipe Pose)
+  * geometry helpers (angles, scoring curves, aspect-correct landmark access)
+  * single-frame pose inference (YOLO crop → MediaPipe → re-projection)
+  * coaching report generation (Gemini narration with a rule-based fallback)
 
-Scoring formulas are deterministic — same input ALWAYS gives same output.
+The batting / bowling / posture pipelines themselves live in utils/pipeline.py.
+
+Coordinates
+-----------
+Landmarks are stored as MediaPipe-normalised [x, y, z, visibility] plus an
+"_aspect" entry (frame width / height). get_point() multiplies x by the aspect
+so every distance and angle is measured in true "frame height" units. Without
+this, portrait phone videos squashed to a fixed size distort every joint angle.
 """
 
 import json
-import math
 import os
 import re
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict
 
 import numpy as np
 
@@ -32,18 +34,27 @@ LEFT_HIP = 23;       RIGHT_HIP = 24
 LEFT_KNEE = 25;      RIGHT_KNEE = 26
 LEFT_ANKLE = 27;     RIGHT_ANKLE = 28
 
+# COCO class ids used with YOLOv8
+COCO_PERSON = 0
+COCO_SPORTS_BALL = 32
+COCO_BASEBALL_BAT = 34   # closest COCO proxy for a cricket bat
+
 # ─── Global model singletons (loaded once, reused across ALL requests) ────────
 _yolo_model = None
+_yolo_pose_model = None
 _mp_pose_c1 = None
 _mp_pose_c2 = None
-_video_validator = None
-_action_classifier = None
-_fault_detector = None
 
 
-from utils.video_validator import VideoValidator
-from utils.action_classifier import ActionClassifier
-from utils.fault_detector import FaultDetector
+def _load_yolo(env_var: str, default: str):
+    from ultralytics import YOLO
+    weight = os.getenv(env_var, default)
+    if not os.path.isabs(weight):
+        # Resolve against the service folder, not the launch directory, so the
+        # weights are downloaded once and found on every start.
+        service_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        weight = os.path.join(service_dir, weight)
+    return YOLO(weight)
 
 
 def _get_yolo():
@@ -51,9 +62,7 @@ def _get_yolo():
     global _yolo_model
     if _yolo_model is None:
         try:
-            from ultralytics import YOLO
-            weight = os.getenv("YOLO_WEIGHTS_PATH", "yolov8n.pt")
-            _yolo_model = YOLO(weight)
+            _yolo_model = _load_yolo("YOLO_WEIGHTS_PATH", "yolov8n.pt")
             print("[Info] YOLOv8 model loaded")
         except Exception as e:
             print(f"[Warn] YOLOv8 load failed (will skip crop): {e}")
@@ -61,25 +70,17 @@ def _get_yolo():
     return _yolo_model if _yolo_model else None
 
 
-def get_video_validator():
-    global _video_validator
-    if _video_validator is None:
-        _video_validator = VideoValidator(yolo_model=_get_yolo())
-    return _video_validator
-
-
-def get_action_classifier():
-    global _action_classifier
-    if _action_classifier is None:
-        _action_classifier = ActionClassifier()
-    return _action_classifier
-
-
-def get_fault_detector():
-    global _fault_detector
-    if _fault_detector is None:
-        _fault_detector = FaultDetector()
-    return _fault_detector
+def _get_yolo_pose():
+    """YOLOv8n-pose: coarse keypoints for every person in one pass (used to find the bowler)."""
+    global _yolo_pose_model
+    if _yolo_pose_model is None:
+        try:
+            _yolo_pose_model = _load_yolo("YOLO_POSE_WEIGHTS_PATH", "yolov8n-pose.pt")
+            print("[Info] YOLOv8-pose model loaded")
+        except Exception as e:
+            print(f"[Warn] YOLOv8-pose load failed: {e}")
+            _yolo_pose_model = False
+    return _yolo_pose_model if _yolo_pose_model else None
 
 
 def _get_mp_pose(complexity: int = 1):
@@ -100,7 +101,6 @@ def _get_mp_pose(complexity: int = 1):
                 model_complexity=1,
                 enable_segmentation=False,
                 min_detection_confidence=0.30,
-                min_tracking_confidence=0.30,
             )
             print("[Info] MediaPipe Pose (complexity=1) singleton ready")
         return _mp_pose_c1
@@ -111,12 +111,9 @@ def _get_mp_pose(complexity: int = 1):
                 model_complexity=2,
                 enable_segmentation=False,
                 min_detection_confidence=0.25,
-                min_tracking_confidence=0.25,
             )
             print("[Info] MediaPipe Pose (complexity=2) singleton ready")
         return _mp_pose_c2
-
-
 
 
 def warmup_models():
@@ -126,29 +123,26 @@ def warmup_models():
         yolo = _get_yolo()
         if yolo:
             dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-            yolo(dummy, verbose=False, conf=0.99)
+            yolo(dummy, verbose=False, conf=0.99, imgsz=320)
             print("[Info] YOLO warm-up done")
     except Exception as e:
         print(f"[Warn] YOLO warm-up error (non-fatal): {e}")
 
     try:
+        pose_model = _get_yolo_pose()
+        if pose_model:
+            pose_model(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False, conf=0.99, imgsz=320)
+    except Exception as e:
+        print(f"[Warn] YOLO-pose warm-up error (non-fatal): {e}")
+
+    try:
         pose = _get_mp_pose(1)
-        dummy_rgb = np.zeros((480, 640, 3), dtype=np.uint8)
-        pose.process(dummy_rgb)
+        pose.process(np.zeros((480, 640, 3), dtype=np.uint8))
         print("[Info] MediaPipe Pose (c=1) warm-up done")
     except Exception as e:
         print(f"[Warn] MediaPipe Pose warm-up error (non-fatal): {e}")
 
-    try:
-        get_video_validator()
-        get_action_classifier()
-        get_fault_detector()
-        print("[Info] ML pipeline models loaded and warmed up")
-    except Exception as e:
-        print(f"[Warn] ML models warm-up error: {e}")
-
     print("[Ready] All models ready — service is hot")
-
 
 
 # ─── Basic helpers ────────────────────────────────────────────────────────────
@@ -158,6 +152,7 @@ def clamp_score(value: float, low: int = 0, high: int = 100) -> int:
 
 
 def calculate_angle(a: List[float], b: List[float], c: List[float]) -> float:
+    """Angle ABC in degrees (0–180)."""
     a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
     radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
@@ -167,7 +162,7 @@ def calculate_angle(a: List[float], b: List[float], c: List[float]) -> float:
 
 
 def score_angle(angle: float, ideal_min: float, ideal_max: float) -> int:
-    """Score an angle based on deviation from an ideal range. 98 at center, degrades outward."""
+    """Score an angle (degrees) by deviation from an ideal range. 98 at centre, degrades outward."""
     mid = (ideal_min + ideal_max) / 2
     half_range = max((ideal_max - ideal_min) / 2, 1)
     deviation = abs(angle - mid)
@@ -176,27 +171,49 @@ def score_angle(angle: float, ideal_min: float, ideal_max: float) -> int:
     return clamp_score(86 - (deviation - half_range) * 1.8, 0, 100)
 
 
+def range_score(value: Optional[float], lo: float, hi: float, falloff: float) -> Optional[int]:
+    """
+    Unit-agnostic version of score_angle.
+    Inside [lo, hi]: 100 at the centre down to 86 at the edges.
+    Outside: drops linearly, reaching 26 one `falloff` beyond the edge, then 0.
+    """
+    if value is None or not np.isfinite(value):
+        return None
+    mid = (lo + hi) / 2
+    half = max((hi - lo) / 2, 1e-9)
+    dev = abs(value - mid)
+    if dev <= half:
+        return clamp_score(100 - 14 * dev / half)
+    return clamp_score(86 - 60 * (dev - half) / falloff)
+
+
 def get_point(landmarks: dict, idx: int) -> Optional[List[float]]:
+    """Landmark (x, y) in aspect-correct frame-height units, or None."""
     lm = landmarks.get(idx)
     if lm is None:
+        lm = landmarks.get(str(idx))   # landmarks that went through JSON
+    if lm is None:
         return None
+    aspect = float(landmarks.get("_aspect", 1.0) or 1.0)
     if isinstance(lm, dict):
-        return [lm["x"], lm["y"]]
-    return [lm[0], lm[1]]
+        return [lm["x"] * aspect, lm["y"]]
+    return [lm[0] * aspect, lm[1]]
 
 
 # ─── Frame utilities ──────────────────────────────────────────────────────────
 
-TARGET_W, TARGET_H = 640, 480
+MAX_SIDE = 640
 BLUR_THRESHOLD = 40.0
 
 
-def _resize_frame(frame: np.ndarray) -> np.ndarray:
+def resize_keep_aspect(frame: np.ndarray, max_side: int = MAX_SIDE) -> np.ndarray:
     import cv2
     h, w = frame.shape[:2]
-    if w == TARGET_W and h == TARGET_H:
+    scale = max_side / max(h, w)
+    if scale >= 1:
         return frame
-    return cv2.resize(frame, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+    # INTER_LINEAR is ~10× faster than INTER_AREA on 1080p input and accurate enough for pose.
+    return cv2.resize(frame, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_LINEAR)
 
 
 def _is_sharp(frame: np.ndarray, threshold: float = BLUR_THRESHOLD) -> bool:
@@ -206,780 +223,211 @@ def _is_sharp(frame: np.ndarray, threshold: float = BLUR_THRESHOLD) -> bool:
 
 
 def extract_frames(video_path: str, num_frames: int = 20) -> List[np.ndarray]:
-    """Extract evenly-spaced frames from a video, filtered for sharpness."""
+    """Evenly spaced, sharpness-filtered frames across a whole video (used by train_models.py)."""
     import cv2
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             cap.release()
             return []
-
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
+        raw: List[np.ndarray] = []
         if total <= 0:
-            raw: List[np.ndarray] = []
-            while True:
+            while len(raw) < num_frames * 4:
                 ret, frm = cap.read()
                 if not ret or frm is None:
                     break
                 raw.append(frm)
-            cap.release()
         else:
-            indices = np.linspace(0, max(total - 1, 0), num=min(num_frames * 3, total), dtype=int)
-            raw = []
-            for idx in indices:
+            for idx in np.linspace(0, total - 1, num=min(num_frames * 3, total), dtype=int):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
                 ret, frm = cap.read()
                 if ret and frm is not None:
                     raw.append(frm)
-            cap.release()
-
-            if not raw:
-                cap2 = cv2.VideoCapture(video_path)
-                while len(raw) < num_frames * 4:
-                    ret, frm = cap2.read()
-                    if not ret or frm is None:
-                        break
-                    raw.append(frm)
-                cap2.release()
-
+        cap.release()
         if not raw:
             return []
-
+        raw = [resize_keep_aspect(f) for f in raw]
         sharp = [f for f in raw if _is_sharp(f)]
         pool = sharp if len(sharp) >= max(num_frames // 3, 3) else raw
-
         n = min(num_frames, len(pool))
-        indices2 = np.linspace(0, len(pool) - 1, num=n, dtype=int)
-        return [pool[int(i)] for i in indices2]
-
+        return [pool[int(i)] for i in np.linspace(0, len(pool) - 1, num=n, dtype=int)]
     except Exception as e:
         print(f"Frame extraction error: {e}")
         return []
 
 
-# ─── YOLO player crop ─────────────────────────────────────────────────────────
+# ─── Person detection + pose inference ────────────────────────────────────────
 
-def _yolo_crop_person(frame: np.ndarray, pad: float = 0.15) -> Optional[Tuple[np.ndarray, Tuple, dict]]:
+def _box_iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def detect_people(frame: np.ndarray, conf: float = 0.25, imgsz: int = 416) -> List[Tuple[List[float], float]]:
+    """All person detections as ([x1, y1, x2, y2], confidence), largest first."""
     model = _get_yolo()
     if model is None:
-        return None
+        return []
     try:
-        # Detect person (0), sports ball (32), baseball bat (77)
-        results = model(frame, verbose=False, conf=0.15, classes=[0, 32, 77])
+        results = model(frame, verbose=False, conf=conf, classes=[COCO_PERSON], imgsz=imgsz)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
-            return None
-
-        person_box = None
-        best_conf = 0.0
-        detections = {"bat": None, "ball": None}
-
-        for box in boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            xyxy = [float(v) for v in box.xyxy[0]]
-
-            if cls_id == 0:
-                if conf > best_conf:
-                    best_conf = conf
-                    person_box = xyxy
-            elif cls_id == 77:
-                detections["bat"] = xyxy
-            elif cls_id == 32:
-                detections["ball"] = xyxy
-
-        if person_box is None:
-            return None
-
-        x1, y1, x2, y2 = person_box
-        h, w = frame.shape[:2]
-        bw, bh = x2 - x1, y2 - y1
-        px, py = bw * pad, bh * pad
-
-        cx1 = max(0, int(x1 - px))
-        cy1 = max(0, int(y1 - py))
-        cx2 = min(w, int(x2 + px))
-        cy2 = min(h, int(y2 + py))
-
-        if cx2 <= cx1 or cy2 <= cy1:
-            return None
-
-        crop = frame[cy1:cy2, cx1:cx2]
-        return crop, (cx1, cy1, cx2, cy2), detections
-
+            return []
+        people = [([float(v) for v in b.xyxy[0]], float(b.conf[0])) for b in boxes]
+        return sorted(people, key=lambda p: (p[0][2] - p[0][0]) * (p[0][3] - p[0][1]), reverse=True)
     except Exception as e:
-        print(f"YOLO crop error: {e}")
+        print(f"YOLO person detection error: {e}")
+        return []
+
+
+def match_box(people: List[Tuple[List[float], float]], prev_box) -> Optional[List[float]]:
+    """
+    The detection that continues `prev_box`: best overlap, else the nearest centre
+    within about one box size. None when nothing plausible is found — the caller
+    keeps the previous box rather than jumping to another player.
+    """
+    if not people:
         return None
+    best = max(people, key=lambda p: _box_iou(p[0], prev_box))
+    if _box_iou(best[0], prev_box) > 0.1:
+        return best[0]
+    pcx, pcy = (prev_box[0] + prev_box[2]) / 2, (prev_box[1] + prev_box[3]) / 2
+    size = max(prev_box[2] - prev_box[0], prev_box[3] - prev_box[1])
+
+    def dist(p):
+        b = p[0]
+        return np.hypot((b[0] + b[2]) / 2 - pcx, (b[1] + b[3]) / 2 - pcy)
+
+    near = min(people, key=dist)
+    return near[0] if dist(near) < size else None
 
 
-# ─── Single-frame pose inference ──────────────────────────────────────────────
+def detect_person_box(frame: np.ndarray, prev_box=None, conf: float = 0.25) -> Optional[List[float]]:
+    """
+    Pixel box [x1, y1, x2, y2] of the player. With a previous box the same player
+    is followed; otherwise the largest confident person wins.
+    """
+    people = detect_people(frame, conf)
+    if prev_box is not None:
+        return match_box(people, prev_box)
+    if not people:
+        return None
+    return max(people, key=lambda p: (p[0][2] - p[0][0]) * (p[0][3] - p[0][1]) * p[1])[0]
 
-def _run_mediapipe_on_frame(
-    frame_bgr: np.ndarray,
-    complexity: int = 1,
-    conf: float = 0.30,
-) -> Optional[dict]:
+
+def people_arm_heights(frame: np.ndarray, conf: float = 0.25) -> List[Tuple[List[float], float]]:
+    """
+    ([x1, y1, x2, y2], arm height) for every person, from one YOLOv8-pose pass.
+    Arm height = highest wrist above its shoulder in torso lengths (COCO keypoints).
+    """
+    model = _get_yolo_pose()
+    if model is None:
+        return []
+    try:
+        r = model(frame, verbose=False, conf=conf, imgsz=640)[0]
+        if r.keypoints is None or r.boxes is None or len(r.boxes) == 0:
+            return []
+        kps = r.keypoints.data.cpu().numpy()          # (N, 17, 3): x, y, confidence
+        out = []
+        for box, k in zip(r.boxes.xyxy.cpu().numpy(), kps):
+            ok = k[:, 2] > 0.3
+            if not (ok[5] and ok[6] and ok[11] and ok[12]):
+                continue
+            torso = np.linalg.norm((k[5, :2] + k[6, :2]) / 2 - (k[11, :2] + k[12, :2]) / 2)
+            if torso <= 0:
+                continue
+            heights = [(k[s, 1] - k[w, 1]) / torso for s, w in ((5, 9), (6, 10)) if ok[s] and ok[w]]
+            if heights:
+                out.append(([float(v) for v in box], float(max(heights))))
+        return out
+    except Exception as e:
+        print(f"YOLO-pose error: {e}")
+        return []
+
+
+def detect_balls(frame: np.ndarray, conf: float = 0.08) -> List[Tuple[float, float, float]]:
+    """Sports-ball detections as (cx, cy, size) in pixels."""
+    model = _get_yolo()
+    if model is None:
+        return []
+    try:
+        results = model(frame, verbose=False, conf=conf, classes=[COCO_SPORTS_BALL], imgsz=640)
+        out = []
+        for b in results[0].boxes:
+            x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
+            out.append(((x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1)))
+        return out
+    except Exception as e:
+        print(f"YOLO ball detection error: {e}")
+        return []
+
+
+def pose_on_frame(frame_bgr: np.ndarray, box=None, complexity: int = 1, pad: float = 0.2) -> Optional[dict]:
+    """
+    MediaPipe pose for one frame. With a person box the crop is padded and the
+    landmarks re-projected to full-frame normalised coordinates.
+    """
     import cv2
 
-    frame_bgr = _resize_frame(frame_bgr)
+    full_h, full_w = frame_bgr.shape[:2]
+    cx1, cy1, cx2, cy2 = 0, 0, full_w, full_h
+    if box is not None:
+        x1, y1, x2, y2 = box
+        px, py = (x2 - x1) * pad, (y2 - y1) * pad
+        cx1, cy1 = max(0, int(x1 - px)), max(0, int(y1 - py))
+        cx2, cy2 = min(full_w, int(x2 + px)), min(full_h, int(y2 + py))
+        if cx2 - cx1 < 16 or cy2 - cy1 < 16:
+            cx1, cy1, cx2, cy2 = 0, 0, full_w, full_h
 
-    crop_result = _yolo_crop_person(frame_bgr)
-    detections = {"bat": None, "ball": None}
-    if crop_result is not None:
-        crop_frame, (cx1, cy1, cx2, cy2), detections = crop_result
-        input_frame = crop_frame
-    else:
-        input_frame = frame_bgr
-        cx1 = cy1 = 0
-        cx2, cy2 = frame_bgr.shape[1], frame_bgr.shape[0]
-
-    frame_rgb = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
-
+    crop = frame_bgr[cy1:cy2, cx1:cx2]
     try:
-        pose = _get_mp_pose(complexity)
-        results = pose.process(frame_rgb)
-
-        if not results.pose_landmarks:
-            return None
-
-        crop_h, crop_w = input_frame.shape[:2]
-        full_h, full_w = frame_bgr.shape[:2]
-
-        landmarks: dict = {}
-        for idx, lm in enumerate(results.pose_landmarks.landmark):
-            if crop_result is not None:
-                abs_x = cx1 + lm.x * crop_w
-                abs_y = cy1 + lm.y * crop_h
-                nx = abs_x / full_w
-                ny = abs_y / full_h
-            else:
-                nx, ny = lm.x, lm.y
-
-            landmarks[idx] = [round(nx, 4), round(ny, 4),
-                               round(lm.z, 4), round(lm.visibility, 4)]
-
-        # Store bat and ball detections if found
-        if detections.get("bat") is not None:
-            landmarks["bat"] = [round(detections["bat"][0] / full_w, 4), round(detections["bat"][1] / full_h, 4),
-                                round(detections["bat"][2] / full_w, 4), round(detections["bat"][3] / full_h, 4)]
-        if detections.get("ball") is not None:
-            landmarks["ball"] = [round(detections["ball"][0] / full_w, 4), round(detections["ball"][1] / full_h, 4),
-                                 round(detections["ball"][2] / full_w, 4), round(detections["ball"][3] / full_h, 4)]
-
-        return landmarks
-
+        results = _get_mp_pose(complexity).process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     except Exception as e:
         print(f"MediaPipe inference error: {e}")
         return None
+    if not results.pose_landmarks:
+        return None
 
+    crop_h, crop_w = crop.shape[:2]
+    landmarks: dict = {}
+    for idx, lm in enumerate(results.pose_landmarks.landmark):
+        nx = (cx1 + lm.x * crop_w) / full_w
+        ny = (cy1 + lm.y * crop_h) / full_h
+        landmarks[idx] = [round(nx, 4), round(ny, 4), round(lm.z, 4), round(lm.visibility, 4)]
+    landmarks["_aspect"] = round(full_w / full_h, 5)
+    return landmarks
+
+
+def _run_mediapipe_on_frame(frame_bgr: np.ndarray, complexity: int = 1) -> Optional[dict]:
+    """YOLO crop → MediaPipe on a single frame; falls back to the full frame."""
+    frame_bgr = resize_keep_aspect(frame_bgr)
+    box = detect_person_box(frame_bgr)
+    lm = pose_on_frame(frame_bgr, box, complexity) if box is not None else None
+    if lm is None:
+        lm = pose_on_frame(frame_bgr, None, complexity)
+    return lm
 
 
 def analyze_pose_from_video_frames(frames: List[np.ndarray]) -> List[Optional[dict]]:
-    """
-    Run the full YOLO→crop→MediaPipe pipeline on every frame.
-    Two-pass: complexity=1 first; retry with complexity=2 if < 10% valid.
-    """
-    if not frames:
-        return []
-
-    def _run_pass(complexity: int, conf: float) -> List[Optional[dict]]:
-        out = []
-        for frm in frames:
-            lm = _run_mediapipe_on_frame(frm, complexity=complexity, conf=conf)
-            out.append(lm)
-        return out
-
-    results = _run_pass(complexity=1, conf=0.30)
-    valid = sum(1 for r in results if r is not None)
-    print(f"Pose pass-1 (c=1, conf=0.30): {valid}/{len(frames)} detections")
-
-    if valid < max(1, len(frames) * 0.10):
-        print("Low detection rate — retrying with complexity=2, conf=0.20 ...")
-        results2 = _run_pass(complexity=2, conf=0.20)
-        valid2 = sum(1 for r in results2 if r is not None)
-        print(f"Pose pass-2 (c=2, conf=0.20): {valid2}/{len(frames)} detections")
-        for i, (r1, r2) in enumerate(zip(results, results2)):
-            if r1 is None and r2 is not None:
-                results[i] = r2
-        valid = sum(1 for r in results if r is not None)
-
-    print(f"Final detection: {valid}/{len(frames)} frames with pose")
-    return results
+    """Independent per-frame pose (used by train_models.py)."""
+    return [_run_mediapipe_on_frame(f) for f in frames]
 
 
 def analyze_pose_from_image(image_path: str) -> Optional[dict]:
-    """Run YOLO→crop→MediaPipe on a single image file."""
+    """Run YOLO→crop→MediaPipe on a single image file (complexity 2 retry)."""
     import cv2
     image = cv2.imread(image_path)
     if image is None:
         return None
-
-    for c, conf in [(1, 0.30), (2, 0.20)]:
-        lm = _run_mediapipe_on_frame(image, complexity=c, conf=conf)
+    for complexity in (1, 2):
+        lm = _run_mediapipe_on_frame(image, complexity=complexity)
         if lm is not None:
             return lm
     return None
-
-
-def validate_video_locally(frames: List[np.ndarray], action_expected: str) -> Tuple[bool, str]:
-    """
-    Local, verifiable video validation pipeline using the trained PyTorch Video Validator:
-    Returns (is_valid, error_description)
-    """
-    if not frames:
-        return False, "ERR_INVALID_VIDEO: Could not extract frames from the video."
-
-    validator = get_video_validator()
-    is_valid, err_msg = validator.validate(frames)
-    return is_valid, err_msg
-
-
-
-# ─── Cricket content validation ───────────────────────────────────────────────
-
-async def validate_cricket_content_async(image: np.ndarray) -> bool:
-    """
-    Validate that a frame shows cricket content using Gemini Vision.
-    Returns True = likely cricket; False = clearly non-cricket.
-    Falls through to True on any error.
-    Always returns True if GEMINI_API_KEY is not set.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return True
-
-    try:
-        import cv2
-        import PIL.Image
-        from google import genai
-
-        client = genai.Client(api_key=api_key)
-        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        pil_img = PIL.Image.fromarray(img_rgb)
-
-        prompt = (
-            "Does this image show a person playing cricket (batting, bowling, fielding) "
-            "or a cricket ground/training session? "
-            "Reply ONLY with YES or NO. No explanation."
-        )
-        response = await client.aio.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-            contents=[prompt, pil_img],
-        )
-        answer = (response.text or "").strip().upper()
-        return "YES" in answer
-
-    except Exception as e:
-        print(f"Cricket validation error (non-fatal, allowing through): {e}")
-        return True
-
-
-# ─── Ball speed estimation ────────────────────────────────────────────────────
-
-def estimate_ball_speed(frames: List[np.ndarray]) -> Optional[float]:
-    """
-    Estimate relative ball speed in km/h using dense optical flow.
-    Returns a float or None if fewer than 2 frames or computation fails.
-    NOTE: This estimates RELATIVE motion magnitude, not absolute km/h.
-          Use speedClassification() for an honest human-readable label.
-    """
-    if len(frames) < 2:
-        return None
-
-    import cv2
-
-    try:
-        small = [_resize_frame(f) for f in frames]
-        motion: List[float] = []
-        for i in range(len(small) - 1):
-            prev = cv2.cvtColor(small[i], cv2.COLOR_BGR2GRAY)
-            nxt = cv2.cvtColor(small[i + 1], cv2.COLOR_BGR2GRAY)
-            flow = cv2.calcOpticalFlowFarneback(
-                prev, nxt, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
-            mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            valid_mag = mag[np.isfinite(mag)]
-            if valid_mag.size:
-                motion.append(float(np.percentile(valid_mag, 92)))
-
-        if not motion:
-            return None
-
-        motion_score = float(np.median(motion))
-        # Calibrated range: 80 km/h = slow, 160 km/h = very fast
-        speed_kmh = 80.0 + min(80.0, motion_score * 18.0)
-        return round(float(np.clip(speed_kmh, 80.0, 160.0)), 1)
-
-    except Exception as e:
-        print(f"Ball speed estimation error: {e}")
-        return None
-
-
-def classify_ball_speed(speed_kmh: Optional[float]) -> str:
-    """Convert speed estimate to honest classification string."""
-    if speed_kmh is None:
-        return "Undetected"
-    if speed_kmh >= 135:
-        return "Fast"
-    if speed_kmh >= 115:
-        return "Medium-Fast"
-    if speed_kmh >= 95:
-        return "Medium"
-    return "Spin/Slow"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DETERMINISTIC SCORING ENGINE
-# Every function below takes measured landmark data and returns a score.
-# No random numbers. No hardcoded values. Same input → same output.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def calculate_head_stability(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Measures variance of NOSE Y-position across all frames.
-    High variance = unstable head = low score.
-    
-    Formula: score = max(0, 1 - variance / 0.005) × 100
-    Thresholds: variance < 0.0005 = excellent, > 0.005 = poor
-    """
-    valid = [f for f in frames if f and NOSE in f]
-    if len(valid) < 3:
-        return {"score": 50, "variance": None, "note": "Insufficient frames for head stability"}
-
-    y_vals = [f[NOSE][1] for f in valid]
-    variance = float(np.var(y_vals))
-    score = float(np.clip(1.0 - (variance / 0.005), 0, 1)) * 100
-
-    if variance < 0.0005:
-        note = "Excellent — head is very still through the shot"
-    elif variance < 0.002:
-        note = "Good — minor head movement detected"
-    elif variance < 0.005:
-        note = "Fair — noticeable head movement, work on keeping eyes level"
-    else:
-        note = "Poor — excessive head movement disrupting shot execution"
-
-    return {
-        "score": clamp_score(score, 0, 100),
-        "variance": round(variance, 6),
-        "note": note
-    }
-
-
-def calculate_timing_score(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Batting timing: measures left knee angle trajectory across frames.
-    A correctly timed shot shows: knee flexion at impact → full extension at follow-through.
-    
-    Formula:
-      - Flexion score: score_angle(min_knee_angle, ideal 110-145°)
-      - Extension score: score_angle(max_knee_angle, ideal 160-180°)
-      - Range score: clamp(range_of_motion × 2.5, 0, 100)
-      - Final: 0.4×flexion + 0.4×extension + 0.2×range
-    """
-    knee_angles = []
-    for f in frames:
-        if not f:
-            continue
-        lh = get_point(f, LEFT_HIP)
-        lk = get_point(f, LEFT_KNEE)
-        la = get_point(f, LEFT_ANKLE)
-        if lh and lk and la:
-            knee_angles.append(calculate_angle(lh, lk, la))
-
-    if len(knee_angles) < 3:
-        return {"score": 50, "peakFlexion": None, "peakExtension": None, "rangeOfMotion": None,
-                "note": "Insufficient frames for timing analysis"}
-
-    min_angle = float(min(knee_angles))
-    max_angle = float(max(knee_angles))
-    range_of_motion = max_angle - min_angle
-
-    flexion_score = score_angle(min_angle, 110, 145)
-    extension_score = score_angle(max_angle, 160, 180)
-    range_score = clamp_score(range_of_motion * 2.5, 0, 100)
-
-    final = clamp_score(flexion_score * 0.4 + extension_score * 0.4 + range_score * 0.2, 0, 100)
-
-    if range_of_motion < 15:
-        note = "Poor timing — minimal knee drive through the shot"
-    elif range_of_motion < 30:
-        note = "Fair timing — moderate knee flexion-extension cycle"
-    elif min_angle < 110:
-        note = "Over-flexed at impact — weight too far forward"
-    elif max_angle < 155:
-        note = "Incomplete extension — follow-through cut short"
-    else:
-        note = "Good timing — proper knee flexion and extension cycle"
-
-    return {
-        "score": final,
-        "peakFlexion": round(min_angle, 1),
-        "peakExtension": round(max_angle, 1),
-        "rangeOfMotion": round(range_of_motion, 1),
-        "note": note
-    }
-
-
-def calculate_balance_score(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Balance: measures hip levelness and spine verticality across all frames.
-    
-    Formula:
-      - avgHipTilt: mean(|left_hip_Y - right_hip_Y|) across frames
-      - avgSpineOffset: mean(|mid_shoulder_X - mid_hip_X|) across frames
-      - hipScore: clamp(100 - avgHipTilt/0.001, 0, 100)
-      - spineScore: clamp(100 - avgSpineOffset/0.0008, 0, 100)
-      - Final: 0.5×hip + 0.5×spine
-    """
-    hip_tilts, spine_offsets = [], []
-    for f in frames:
-        if not f:
-            continue
-        lh = get_point(f, LEFT_HIP)
-        rh = get_point(f, RIGHT_HIP)
-        ls = get_point(f, LEFT_SHOULDER)
-        rs = get_point(f, RIGHT_SHOULDER)
-
-        if lh and rh:
-            hip_tilts.append(abs(lh[1] - rh[1]))
-        if lh and rh and ls and rs:
-            mid_hip_x = (lh[0] + rh[0]) / 2
-            mid_sh_x = (ls[0] + rs[0]) / 2
-            spine_offsets.append(abs(mid_hip_x - mid_sh_x))
-
-    if not hip_tilts:
-        return {"score": 50, "avgHipTilt": None, "avgSpineOffset": None,
-                "note": "Insufficient frames for balance analysis"}
-
-    avg_hip_tilt = float(np.mean(hip_tilts))
-    avg_spine_offset = float(np.mean(spine_offsets)) if spine_offsets else 0.0
-
-    hip_score = clamp_score(100 - (avg_hip_tilt / 0.001), 0, 100)
-    spine_score = clamp_score(100 - (avg_spine_offset / 0.0008), 0, 100)
-    final = clamp_score(hip_score * 0.5 + spine_score * 0.5, 0, 100)
-
-    if avg_hip_tilt < 0.02 and avg_spine_offset < 0.03:
-        note = "Excellent — hips level and spine aligned throughout"
-    elif avg_hip_tilt < 0.05:
-        note = "Good — minor hip tilt, spine reasonably aligned"
-    elif avg_hip_tilt < 0.08:
-        note = "Fair — noticeable hip tilt affecting weight transfer"
-    else:
-        note = "Poor — significant balance issues, risk of injury"
-
-    return {
-        "score": final,
-        "avgHipTilt": round(avg_hip_tilt, 5),
-        "avgSpineOffset": round(avg_spine_offset, 5),
-        "hipScore": hip_score,
-        "spineScore": spine_score,
-        "note": note
-    }
-
-
-def calculate_stride_score(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Measures front foot displacement relative to back foot, normalized to hip width.
-    
-    Formula:
-      - strideRatio = ankle_spread / hip_width per frame
-      - score = score_angle(mean_strideRatio, ideal_min=1.5, ideal_max=2.5)
-    Ideal batting stride: 1.5–2.5× hip width. Too wide = unstable. Too narrow = no power.
-    """
-    stride_ratios = []
-    for f in frames:
-        if not f:
-            continue
-        la = get_point(f, LEFT_ANKLE)
-        ra = get_point(f, RIGHT_ANKLE)
-        lh = get_point(f, LEFT_HIP)
-        rh = get_point(f, RIGHT_HIP)
-
-        if la and ra and lh and rh:
-            ankle_spread = abs(la[0] - ra[0])
-            hip_width = abs(lh[0] - rh[0])
-            if hip_width > 0.01:
-                stride_ratios.append(ankle_spread / hip_width)
-
-    if not stride_ratios:
-        return {"score": 50, "avgStrideRatio": None, "note": "Insufficient frames for stride analysis"}
-
-    avg_ratio = float(np.mean(stride_ratios))
-    score = score_angle(avg_ratio, 1.5, 2.5)
-
-    if avg_ratio < 1.0:
-        note = f"Narrow stance ({avg_ratio:.2f}× hip width) — limited power transfer"
-    elif avg_ratio > 3.0:
-        note = f"Too wide ({avg_ratio:.2f}× hip width) — unstable base"
-    elif 1.5 <= avg_ratio <= 2.5:
-        note = f"Good stride width ({avg_ratio:.2f}× hip width) — solid batting base"
-    else:
-        note = f"Slightly off ideal ({avg_ratio:.2f}× hip width) — minor adjustment needed"
-
-    return {
-        "score": score,
-        "avgStrideRatio": round(avg_ratio, 3),
-        "note": note
-    }
-
-
-def calculate_arm_smoothness(frames: List[Optional[dict]], landmark_id: int = RIGHT_WRIST) -> Dict[str, Any]:
-    """
-    Measures bowling arm rotation smoothness using jerk metric.
-    Jerk = rate of change of acceleration. Low jerk = smooth rotation.
-    
-    Formula:
-      - velocities = ||diff(positions)||
-      - accelerations = diff(velocities)
-      - jerk = mean(|diff(accelerations)|)
-      - score = max(0, 1 - jerk/0.03) × 100
-    """
-    pts = []
-    for f in frames:
-        if f and landmark_id in f:
-            pts.append(f[landmark_id][:2])
-
-    if len(pts) < 4:
-        return {"score": 50, "avgJerk": None, "note": "Insufficient frames for arm smoothness"}
-
-    pts_arr = np.array(pts)
-    velocities = np.linalg.norm(np.diff(pts_arr, axis=0), axis=1)
-    accelerations = np.diff(velocities)
-    jerks = np.abs(np.diff(accelerations))
-    avg_jerk = float(np.mean(jerks)) if len(jerks) > 0 else 0.0
-
-    score_raw = max(0.0, 1.0 - (avg_jerk / 0.03)) * 100
-    score = clamp_score(score_raw, 0, 100)
-
-    if avg_jerk < 0.003:
-        note = "Excellent — very smooth arm rotation, consistent seam position"
-    elif avg_jerk < 0.010:
-        note = "Good — arm rotation is mostly smooth"
-    elif avg_jerk < 0.025:
-        note = "Fair — some inconsistency in arm rotation speed"
-    else:
-        note = "Poor — jerky arm rotation affecting line and length"
-
-    return {
-        "score": score,
-        "avgJerk": round(avg_jerk, 6),
-        "note": note
-    }
-
-
-def calculate_release_point_score(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Finds the frame with highest wrist position and scores release point height.
-    High release (wrist above nose) = good bounce extraction.
-    
-    Formula:
-      - Find frame where RIGHT_WRIST Y is minimum (highest in image)
-      - height_score = clamp(70 + (nose_Y - wrist_Y) × 200, 30, 98)
-      - extension_score = score_angle(arm angle at release, 160, 180°)
-      - Final: 0.6×height + 0.4×extension
-    """
-    min_wrist_y = 1.0
-    best_frame = None
-    for f in frames:
-        if not f:
-            continue
-        rw = get_point(f, RIGHT_WRIST)
-        if rw and rw[1] < min_wrist_y:
-            min_wrist_y = rw[1]
-            best_frame = f
-
-    if not best_frame:
-        return {"score": 50, "peakWristY": None, "releaseArmAngle": None,
-                "note": "Could not detect release frame"}
-
-    rw = get_point(best_frame, RIGHT_WRIST)
-    nose = get_point(best_frame, NOSE)
-    elbow = get_point(best_frame, RIGHT_ELBOW)
-    shoulder = get_point(best_frame, RIGHT_SHOULDER)
-
-    height_score = 50
-    if rw and nose:
-        delta = nose[1] - rw[1]  # positive = wrist is above nose = good
-        height_score = clamp_score(70 + delta * 200, 30, 98)
-
-    arm_angle = None
-    extension_score = 50
-    if rw and elbow and shoulder:
-        arm_angle = calculate_angle(shoulder, elbow, rw)
-        extension_score = score_angle(arm_angle, 160, 180)
-
-    final = clamp_score(height_score * 0.6 + extension_score * 0.4, 0, 100)
-
-    if min_wrist_y < 0.3:
-        note = "Excellent high release point — maximum bounce extraction"
-    elif min_wrist_y < 0.45:
-        note = "Good release height — solid bounce and carry"
-    elif min_wrist_y < 0.55:
-        note = "Fair — slightly low release, may lose bounce"
-    else:
-        note = "Low release point — ball will lack bounce and carry"
-
-    return {
-        "score": final,
-        "peakWristY": round(min_wrist_y, 4),
-        "releaseArmAngle": round(arm_angle, 1) if arm_angle else None,
-        "heightScore": height_score,
-        "extensionScore": extension_score,
-        "note": note
-    }
-
-
-def calculate_follow_through_score(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Measures wrist position change from early frames to late frames.
-    In a complete follow-through, the wrist should rise (Y decreases in image coords).
-    
-    Formula:
-      - early_wrist_Y = avg wrist Y in first 33% of frames
-      - late_wrist_Y = avg wrist Y in last 33% of frames
-      - delta = early_Y - late_Y (positive = wrist went UP = good follow-through)
-      - score = clamp(60 + delta × 300, 25, 98)
-    """
-    valid = [f for f in frames if f]
-    if len(valid) < 6:
-        return {"score": 50, "wristYDelta": None, "note": "Insufficient frames for follow-through analysis"}
-
-    n = len(valid)
-    early_frames = valid[:n // 3]
-    late_frames = valid[2 * n // 3:]
-
-    def avg_wrist_y(flist):
-        ys = [get_point(f, RIGHT_WRIST)[1] for f in flist if get_point(f, RIGHT_WRIST)]
-        return float(np.mean(ys)) if ys else 0.5
-
-    early_y = avg_wrist_y(early_frames)
-    late_y = avg_wrist_y(late_frames)
-    delta = early_y - late_y  # positive = wrist went UP = good
-
-    score = clamp_score(60 + delta * 300, 25, 98)
-
-    if delta > 0.15:
-        note = "Excellent follow-through — wrist completes high above impact zone"
-    elif delta > 0.05:
-        note = "Good follow-through — bat completes the arc well"
-    elif delta > -0.02:
-        note = "Fair — partial follow-through, slightly abbreviated"
-    else:
-        note = "Poor follow-through — bat stops at impact, losing pace and direction"
-
-    return {
-        "score": score,
-        "wristYDelta": round(delta, 4),
-        "earlyWristY": round(early_y, 4),
-        "lateWristY": round(late_y, 4),
-        "note": note
-    }
-
-
-def calculate_shoulder_alignment(frames: List[Optional[dict]]) -> Dict[str, Any]:
-    """
-    Measures shoulder levelness across all frames.
-    
-    Formula:
-      - tilt = |left_shoulder_Y - right_shoulder_Y| per frame
-      - score = clamp(98 - mean(tilt) × 520, 35, 98)
-    """
-    tilts = []
-    for f in frames:
-        if not f:
-            continue
-        ls = get_point(f, LEFT_SHOULDER)
-        rs = get_point(f, RIGHT_SHOULDER)
-        if ls and rs:
-            tilts.append(abs(ls[1] - rs[1]))
-
-    if not tilts:
-        return {"score": 50, "avgTilt": None, "note": "Could not detect shoulder alignment"}
-
-    avg_tilt = float(np.mean(tilts))
-    score = clamp_score(98 - avg_tilt * 520, 35, 98)
-
-    if avg_tilt < 0.02:
-        note = "Excellent — shoulders level throughout"
-    elif avg_tilt < 0.05:
-        note = "Good — minor shoulder tilt"
-    elif avg_tilt < 0.09:
-        note = "Fair — noticeable shoulder imbalance"
-    else:
-        note = "Poor — significant shoulder tilt, risk of technique breakdown"
-
-    return {
-        "score": score,
-        "avgTilt": round(avg_tilt, 5),
-        "note": note
-    }
-
-
-def detect_faults(metrics: Dict[str, Any], action_type: str) -> List[Dict[str, Any]]:
-    """
-    Multilabel Fault detection using the trained PyTorch MLP model.
-    """
-    detector = get_fault_detector()
-    return detector.detect(metrics, action_type)
-
-
-
-def compute_overall_batting_score(metrics: Dict[str, Any]) -> int:
-    """
-    Weighted combination of all batting metrics.
-    Weights derived from biomechanical importance in cricket batting.
-    """
-    timing = metrics.get("timingScore", 50)
-    balance = metrics.get("balanceScore", 50)
-    stance = metrics.get("stanceScore", 50)
-    head = metrics.get("headStabilityScore", 50)
-    follow = metrics.get("followThroughScore", 50)
-    stride = metrics.get("strideScore", 50)
-
-    overall = (
-        timing  * 0.25 +
-        balance * 0.20 +
-        stance  * 0.20 +
-        head    * 0.20 +
-        follow  * 0.10 +
-        stride  * 0.05
-    )
-    return clamp_score(overall, 0, 100)
-
-
-def compute_overall_bowling_score(metrics: Dict[str, Any]) -> int:
-    """
-    Weighted combination of all bowling metrics.
-    """
-    arm = metrics.get("armSmoothnessScore", 50)
-    release = metrics.get("releasePointScore", 50)
-    wrist = metrics.get("wristPositionScore", 50)
-    balance = metrics.get("balanceScore", 50)
-
-    overall = (
-        arm     * 0.30 +
-        release * 0.25 +
-        wrist   * 0.25 +
-        balance * 0.20
-    )
-    return clamp_score(overall, 0, 100)
-
-
-def compute_overall_posture_score(metrics: Dict[str, Any]) -> int:
-    shoulder = metrics.get("shoulderAlignmentScore", 50)
-    knee = metrics.get("kneeBendScore", 50)
-    balance = metrics.get("balanceScore", 50)
-    spine = metrics.get("spinePosScore", 50)
-
-    overall = (
-        shoulder * 0.30 +
-        knee     * 0.25 +
-        balance  * 0.25 +
-        spine    * 0.20
-    )
-    return clamp_score(overall, 0, 100)
 
 
 # ─── Report generation ────────────────────────────────────────────────────────
@@ -996,10 +444,9 @@ def _parse_json_response_text(text: str) -> dict:
 
 async def generate_report(metrics: dict, type_: str, faults: List[Dict] = None) -> dict:
     """
-    Generate AI coaching report via Gemini.
-    The LLM receives all computed scores and explains them in natural language.
-    The LLM is PROHIBITED from inventing or changing any score.
-    Falls back to rule-based on error.
+    Generate the coaching narrative via Gemini.
+    The LLM receives the computed scores and only explains them; it may not
+    invent or change scores. Falls back to the rule-based report on any error.
     """
     api_key = os.getenv("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
@@ -1015,43 +462,43 @@ async def generate_report(metrics: dict, type_: str, faults: List[Dict] = None) 
 
     client = genai.Client(api_key=api_key)
 
-    # Format fault summary for the LLM
-    fault_summary = []
-    for f in (faults or []):
-        fault_summary.append(
-            f"[{f['severity'].upper()}] {f['faultText']} "
-            f"({f['metric']}={f['value']}, threshold={f['threshold']})"
-        )
+    fault_summary = [
+        f"[{f['severity'].upper()}] {f['faultText']} ({f['metric']}={f['value']}, threshold={f['threshold']})"
+        for f in (faults or [])
+    ]
+    numeric = {k: v for k, v in metrics.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    notes = {k: v for k, v in metrics.items() if k.endswith("Note") and v}
 
-    # CRITICAL: LLM prompt explicitly prohibits score invention
     prompt = f"""You are a professional cricket coach explaining biomechanical analysis results to a player.
 
 IMPORTANT RULES:
 1. You MUST NOT invent, change, or contradict any of the scores listed below.
-2. You MUST NOT generate new fault codes or scores.
-3. Your ONLY job is to write natural-language explanation for each score and fault.
+2. You MUST NOT add faults that are not listed.
+3. Only call something a strength if its score is 70 or higher; lists may be short or empty.
 4. Reference the actual numeric values in your explanations.
-5. All scores are on a 0-100 scale computed from real pose landmark measurements.
+5. Scores are 0-100 and come from 2D pose estimation on a single camera view.
 
 ANALYSIS TYPE: {type_.capitalize()}
 
-COMPUTED SCORES (DO NOT CHANGE THESE - they are from pose estimation algorithm):
-{json.dumps({k: v for k, v in metrics.items() if isinstance(v, (int, float))}, indent=2)}
+COMPUTED METRICS (DO NOT CHANGE THESE):
+{json.dumps(numeric, indent=2)}
+
+MEASUREMENT NOTES:
+{json.dumps(notes, indent=2)}
 
 DETECTED FAULTS (explain each, do not add new ones):
 {chr(10).join(fault_summary) if fault_summary else 'No faults detected above threshold.'}
 
 Respond in JSON ONLY with this exact structure:
 {{
-  "strengths": ["3-5 specific technical strengths — reference actual score values"],
-  "weaknesses": ["weaknesses based ONLY on the detected faults above"],
-  "mistakes": ["technical mistakes inferred from scores — must cite which score triggered each"],
-  "improvement_suggestions": ["5-7 actionable coaching drills with sets/reps"],
-  "training_drills": ["4-6 specific drills targeting the weakest metrics"],
-  "recommendations": ["3-5 equipment or conditioning notes"],
-  "best_practices": ["4-6 elite performance habits"]
-}}
-Do NOT include any markdown outside the JSON block."""
+  "strengths": ["genuine technical strengths, citing score values"],
+  "weaknesses": ["one entry per detected fault, citing its value"],
+  "mistakes": ["technical mistakes implied by the faults — cite which metric"],
+  "improvement_suggestions": ["3-6 actionable coaching cues"],
+  "training_drills": ["3-5 specific drills with sets/reps targeting the weakest metrics"],
+  "recommendations": ["2-4 conditioning or equipment notes"],
+  "best_practices": ["3-5 habits that support this technique"]
+}}"""
 
     try:
         response = await client.aio.models.generate_content(
@@ -1060,184 +507,182 @@ Do NOT include any markdown outside the JSON block."""
             config=types.GenerateContentConfig(
                 temperature=0.30,
                 response_mime_type="application/json",
+                max_output_tokens=1200,
             ),
         )
         parsed = _parse_json_response_text(response.text or "")
-        return {
-            "strengths":               parsed.get("strengths") or [],
-            "weaknesses":              parsed.get("weaknesses") or [],
-            "mistakes":                parsed.get("mistakes") or [],
-            "improvement_suggestions": parsed.get("improvement_suggestions") or [],
-            "training_drills":         parsed.get("training_drills") or [],
-            "recommendations":         parsed.get("recommendations") or [],
-            "best_practices":          parsed.get("best_practices") or [],
-        }
+        keys = ["strengths", "weaknesses", "mistakes", "improvement_suggestions",
+                "training_drills", "recommendations", "best_practices"]
+        return {k: [str(x) for x in (parsed.get(k) or []) if x] for k in keys}
     except Exception as e:
         print(f"Gemini report error (using rule-based fallback): {e}")
         return _generate_rule_based_report(metrics, type_, faults or [])
 
 
+# Coaching content for each fault code emitted by utils/fault_detector.py.
+# (weakness template, mistake, suggestion, drill) — templates may use {value}.
+FAULT_COACHING = {
+    # batting
+    "HEAD_INSTABILITY": (
+        "Head movement through the shot ({value} torso-lengths of vertical bob)",
+        "Head moving off the line of the ball before contact",
+        "Keep eyes level and the head still until after contact — let the body move under it",
+        "Static-head shadow batting: 3 × 20 reps watching a fixed point on a wall",
+    ),
+    "LATE_TIMING": (
+        "Front foot lands too late relative to the bat swing ({value} ms before contact)",
+        "Bat coming down before the front foot is planted, so weight transfer is incomplete",
+        "Trigger earlier: start the forward press as the bowler's arm comes over",
+        "Drop-ball drill: 3 × 15 feeds, plant the front foot before the ball bounces",
+    ),
+    "EARLY_TIMING": (
+        "Front foot plants long before contact ({value} ms) — the shot is waiting on the ball",
+        "Committing to the front foot too early and losing rhythm into the swing",
+        "Delay the stride slightly and keep the weight balanced until length is picked",
+        "Throwdowns at varied lengths: 3 × 12, stride only once length is read",
+    ),
+    "STIFF_FRONT_KNEE": (
+        "Front knee stays almost straight ({value}° at its most bent)",
+        "Little knee flex in the stride, so the head cannot get over the ball",
+        "Bend the front knee into the shot to bring the head over the line",
+        "Lunge-and-hold front-foot drives: 3 × 10 each, hold the finish for 2 s",
+    ),
+    "POOR_BALANCE": (
+        "Balance through the action (score {value}/100)",
+        "Head falling outside the base or excessive spine lean at the key moment",
+        "Finish every rep balanced — hold the final position for two seconds",
+        "Single-leg balance holds: 3 × 30 s each side, then shadow reps",
+    ),
+    "SHORT_FOLLOW_THROUGH": (
+        "Follow-through is cut short (hands rise only {value} torso-lengths after contact)",
+        "Checking the swing at contact instead of letting the bat finish",
+        "Let the hands finish high over the front shoulder on attacking shots",
+        "Shadow follow-through: 2 × 25 reps finishing with hands above the head",
+    ),
+    "STANCE_WIDTH": (
+        "Stride/stance width is outside the ideal range ({value}× torso length)",
+        "Base too narrow for power or too wide to move freely",
+        "Set feet about shoulder-width at setup and stride roughly one torso length",
+        "Footwork ladder: 3 × 10 reps setting up and striding to markers",
+    ),
+    # bowling
+    "LOW_RELEASE": (
+        "Low release point (wrist {value} torso-lengths above the shoulder)",
+        "Arm dropping at release, reducing height, bounce and carry",
+        "Reach up tall at release — bowl 'over the top' with a high front arm pull",
+        "Wall-target drill: 3 × 8 deliveries releasing above a mark set at full stretch",
+    ),
+    "BENT_ARM_AT_RELEASE": (
+        "Bowling arm bent at release ({value}° at the elbow)",
+        "Elbow not fully extended at release — check with a side-on video",
+        "Keep the arm straight through the arc; get a coach to review the action",
+        "Slow-motion arm circles with a straight arm: 3 × 10 before each session",
+    ),
+    "JERKY_ACTION": (
+        "Arm rotation rhythm (smoothness score {value}/100)",
+        "Arm speed rising and falling during the delivery arc instead of one smooth acceleration",
+        "Build pace gradually through the crease; let the arm accelerate in one continuous arc",
+        "Walk-through bowling at 50% pace: 3 × 6 balls focusing on a single smooth arm swing",
+    ),
+    "WRIST_DROP": (
+        "Wrist behind/below the elbow at release (delta {value})",
+        "Wrist collapsing at release, losing seam position",
+        "Keep the wrist firm and behind the ball with fingers on top at release",
+        "Seam-up catching drill: flick the ball to a partner with a vertical seam, 3 × 20",
+    ),
+    # posture
+    "SHOULDER_TILT": (
+        "Shoulders not level ({value}° tilt)",
+        "Dropping one shoulder in the set-up position",
+        "Set up with level shoulders and eyes",
+        "Mirror set-up checks: 3 × 10 holds of 5 s",
+    ),
+    "KNEE_ANGLE": (
+        "Knee bend outside the athletic range ({value}°)",
+        "Either too upright or too crouched in the ready position",
+        "Soft knees: roughly 140–170° at the knee in the ready position",
+        "Split-step ready-position drill: 3 × 12 reps",
+    ),
+    "SPINE_LEAN": (
+        "Spine leaning away from vertical ({value}°)",
+        "Upper body falling to one side in the set-up",
+        "Stack the head and shoulders over the hips",
+        "Wall posture holds: 3 × 30 s",
+    ),
+}
+
+
 def _generate_rule_based_report(metrics: dict, type_: str, faults: List[Dict] = None) -> dict:
-    """
-    Metric-driven fallback report — derived ENTIRELY from actual extracted scores.
-    Every statement references a real measured value.
-    """
-    strengths, weaknesses, suggestions, drills = [], [], [], []
-    mistakes, recommendations = [], []
+    """Metric-driven fallback report — every statement references a measured value."""
+    strengths: List[str] = []
+    weaknesses: List[str] = []
+    mistakes: List[str] = []
+    suggestions: List[str] = []
+    drills: List[str] = []
+    recommendations: List[str] = []
     best_practices = [
-        "Perform 15 min dynamic mobility warm-up before every session",
+        "Film from side-on at hip height with the whole body in frame",
         "Review your analysis footage weekly to track technique changes",
-        "Maintain a training journal — log scores and key cues each session",
+        "Keep a training journal — log scores and one key cue per session",
     ]
 
-    fault_codes = {f["faultCode"] for f in (faults or [])}
+    for f in faults or []:
+        coaching = FAULT_COACHING.get(f.get("faultCode"))
+        if not coaching:
+            weaknesses.append(f.get("faultText", ""))
+            continue
+        weak, mistake, cue, drill = coaching
+        weaknesses.append(weak.format(value=f.get("value")))
+        mistakes.append(mistake)
+        suggestions.append(cue)
+        drills.append(drill)
+
+    def praise(key: str, label: str, note_key: str):
+        """Strength line for a score ≥ 75, quoting the engine's own measurement note."""
+        v = metrics.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 75:
+            note = metrics.get(note_key)
+            strengths.append(f"{label} ({v}/100)" + (f" — {note}" if note else ""))
 
     if type_ == "batting":
-        stance = metrics.get("stanceScore", 50)
-        head = metrics.get("headStabilityScore", 50)
-        timing = metrics.get("timingScore", 50)
-        follow = metrics.get("followThroughScore", 50)
-        balance = metrics.get("balanceScore", 50)
-        bat_angle = metrics.get("batSwingAngle")
-        peak_flex = metrics.get("peakKneeFlexion")
-        range_of_motion = metrics.get("rangeOfMotion")
-
-        # Strengths from good scores
-        if stance >= 80:
-            strengths.append(f"Excellent batting stance (score: {stance}/100) — solid base for consistent shot-making")
-        if head >= 80:
-            strengths.append(f"Very stable head position (score: {head}/100) — tracking the ball well through impact")
-        if timing >= 80:
-            strengths.append(f"Good timing mechanics (score: {timing}/100) — knee drive timing is effective")
-        if follow >= 80:
-            strengths.append(f"Complete follow-through (score: {follow}/100) — maximum power extracted from each shot")
-        if balance >= 80:
-            strengths.append(f"Excellent balance (score: {balance}/100) — hips and spine well-aligned throughout")
-
-        # Weaknesses from fault codes
-        if "HEAD_INSTABILITY_CRITICAL" in fault_codes or "HEAD_INSTABILITY" in fault_codes:
-            weaknesses.append(f"Head stability (score: {head}/100) — movement during shot disrupts ball tracking")
-            mistakes.append(f"Head moving off the ball at impact (measured variance exceeds safe threshold)")
-            suggestions.append("Ball-tracking drill: watch the ball hit the bat for 30 consecutive deliveries")
-            drills.append("Static head drill: shadow bat with book on head — 3 sets × 20 reps")
-        if "LATE_TIMING" in fault_codes or "LATE_TIMING_CRITICAL" in fault_codes:
-            note = f"peak flexion={peak_flex}°" if peak_flex else f"score={timing}/100"
-            weaknesses.append(f"Shot timing ({note}) — weight transfer completing late")
-            mistakes.append(f"Weight transfer lag — front foot landing too early or too late relative to ball arrival")
-            suggestions.append("Underarm feed drill: 40 feeds at 3/4 pace focusing on early trigger movement")
-            drills.append("Drop-ball drill: 3 sets × 20 reps — trigger at bowler's hand, not at bounce")
-        if "NO_FOLLOW_THROUGH" in fault_codes or "SHORT_FOLLOW_THROUGH" in fault_codes:
-            weaknesses.append(f"Follow-through (score: {follow}/100) — bat stopping before completion")
-            mistakes.append("Abbreviated follow-through reducing shot pace and direction control")
-            drills.append("Shadow follow-through: 100 reps ending bat high above left shoulder")
-        if "POOR_BALANCE" in fault_codes or "POOR_BALANCE_CRITICAL" in fault_codes:
-            weaknesses.append(f"Balance (score: {balance}/100) — hip tilt or spine misalignment detected")
-            drills.append("Single-leg balance hold: 3 × 30s each side, then shadow bat")
-
-        if bat_angle is not None:
-            if 30 <= bat_angle <= 65:
-                strengths.append(f"Good bat swing plane ({bat_angle}°) — in the ideal 30-65° range")
-            else:
-                weaknesses.append(f"Bat swing angle ({bat_angle}°) outside ideal 30-65° range")
-                drills.append("Vertical bat drill: 20 throwdowns with straight/cover drive swing plane focus")
-
+        praise("headStabilityScore", "Head stability", "headStabilityNote")
+        praise("timingScore", "Timing", "timingNote")
+        praise("balanceScore", "Balance at contact", "balanceNote")
+        praise("followThroughScore", "Follow-through", "followThroughNote")
+        praise("stanceScore", "Set-up stance", None)
+        praise("strideScore", "Stride", "strideNote")
         recommendations = [
-            "Consider a bat weighing 1.1-1.2 kg for better swing speed and balance",
-            "Review analysis footage weekly to track muscle-memory changes",
-            "Bat grip should be firm but not tense — pressure should be in top 3 fingers",
+            "Use a bat you can pick up and swing without the top hand dominating",
+            "Include hip-mobility work so you can get a full stride to the pitch of the ball",
         ]
-
     elif type_ == "bowling":
-        arm = metrics.get("armSmoothnessScore", 50)
-        release = metrics.get("releasePointScore", 50)
-        wrist = metrics.get("wristPositionScore", 50)
-        balance = metrics.get("balanceScore", 50)
+        praise("armSmoothnessScore", "Arm action", "armSmoothnessNote")
+        praise("releasePointScore", "Release point", "releasePointNote")
+        praise("wristPositionScore", "Wrist position", "wristPositionNote")
+        praise("balanceScore", "Balance at release", "balanceNote")
         speed = metrics.get("estimatedBallSpeed")
-        speed_class = metrics.get("speedClassification", "Undetected")
-        avg_jerk = metrics.get("avgJerk")
-        peak_wrist_y = metrics.get("peakWristY")
-
-        if arm >= 80:
-            strengths.append(f"Smooth arm rotation (score: {arm}/100) — consistent seam position through delivery")
-        if release >= 80:
-            strengths.append(f"High release point (score: {release}/100) — excellent bounce extraction")
-        if wrist >= 80:
-            strengths.append(f"Good wrist position at release (score: {wrist}/100) — seam stability and swing")
-        if balance >= 80:
-            strengths.append(f"Stable delivery stride (score: {balance}/100) — controlled front-side landing")
-        if speed_class in ["Fast", "Medium-Fast"]:
-            strengths.append(f"Pace classification: {speed_class} — effective at this level")
-
-        if "JERKY_ACTION" in fault_codes or "JERKY_ACTION_CRITICAL" in fault_codes:
-            note = f"jerk={avg_jerk:.5f}" if avg_jerk else f"score={arm}/100"
-            weaknesses.append(f"Arm rotation inconsistency ({note}) — rhythm breaking down")
-            mistakes.append("Inconsistent arm rotation speed causing variable release point")
-            suggestions.append("Slow-motion bowling drill: bowl at 50% pace focusing only on smooth arm arc")
-            drills.append("Bowling to a target with no batsman: 30 deliveries focusing on arm speed consistency")
-        if "LOW_RELEASE" in fault_codes or "LOW_RELEASE_CRITICAL" in fault_codes:
-            note = f"wrist_y={peak_wrist_y:.3f}" if peak_wrist_y else f"score={release}/100"
-            weaknesses.append(f"Release point too low ({note}) — losing bounce and carry")
-            mistakes.append("Low arm at release reducing bounce, carry, and pace effectiveness")
-            suggestions.append("High-arm release drill: bowl into a wall target set above head height")
-            drills.append("High-arm bound drill: 3 × 8 jump-and-release repetitions")
-        if "POOR_BALANCE" in fault_codes:
-            weaknesses.append(f"Delivery stride balance (score: {balance}/100) — unstable landing")
-            drills.append("Single-leg landing hold: 3 × 30s each side for landing stability")
-
-        if not speed or speed_class == "Undetected":
-            recommendations = [
-                "Upload a video with the ball clearly visible for speed measurement",
-                "Bowling spikes should have excellent grip on landing foot",
-            ]
+        if speed:
+            recommendations.append(
+                f"Estimated pace {speed} km/h ({metrics.get('speedClassification')}) — measured from a single "
+                "camera, so treat it as approximate"
+            )
         else:
-            recommendations = [
-                f"Current pace classification: {speed_class} — target the next category up",
-                "Ice the bowling shoulder for 10 min after intensive sessions",
-                "Maintain minimum 48h recovery between high-intensity bowling loads",
-            ]
-
+            recommendations.append("Ball was not tracked — film side-on with the ball visible after release for a pace estimate")
+        recommendations.append("Allow 48 h recovery between high-intensity bowling sessions")
     elif type_ == "posture":
-        shoulder = metrics.get("shoulderAlignmentScore", 50)
-        knee = metrics.get("kneeBendScore", 50)
-        balance = metrics.get("balanceScore", 50)
-        spine = metrics.get("spinePosScore", 50)
-        knee_angle = metrics.get("kneeBendAngle")
-
-        if shoulder >= 80:
-            strengths.append(f"Excellent shoulder alignment (score: {shoulder}/100) — balanced upper body")
-        if knee >= 80:
-            ka_str = f" ({knee_angle}°)" if knee_angle else ""
-            strengths.append(f"Good knee bend{ka_str} (score: {knee}/100) — solid athletic base")
-        if balance >= 80:
-            strengths.append(f"Good hip alignment (score: {balance}/100) — stable centre of gravity")
-        if spine >= 80:
-            strengths.append(f"Good spinal posture (score: {spine}/100) — spine aligned over hips")
-
-        if shoulder < 65:
-            weaknesses.append(f"Shoulder alignment (score: {shoulder}/100) — may indicate rotator-cuff asymmetry")
-            drills.append("Shoulder mobility routine: arm circles + cross-body stretch 10 min daily")
-            mistakes.append("Shoulder tilt causing uneven power transfer to batting/bowling arm")
-        if knee < 65:
-            ka_str = f" ({knee_angle}°)" if knee_angle else ""
-            weaknesses.append(f"Knee bend{ka_str} (score: {knee}/100) — outside ideal 140-170° athletic range")
-            drills.append("Bodyweight squat: 3 × 20 reps to build leg strength and mobility")
-            mistakes.append("Insufficient knee flex reducing explosive power and lateral movement")
-        if balance < 65:
-            weaknesses.append(f"Hip alignment (score: {balance}/100) — hip tilt shifting centre of gravity")
-            drills.append("Warrior I/II yoga hold: 3 × 30s each side for hip stability")
-
+        praise("shoulderAlignmentScore", "Shoulders", "shoulderAlignmentNote")
+        praise("kneeBendScore", "Knee bend", "kneeBendNote")
+        praise("balanceScore", "Hips", "balanceNote")
+        praise("spinePosScore", "Spine", "spinePosNote")
         recommendations = [
-            "Focus on core conditioning: 3 × 30s plank + side plank each session",
-            "Consider physiotherapy assessment for shoulder/hip asymmetry",
-            "Include 10 min hip flexor and thoracic spine mobility in every warm-up",
+            "Core conditioning: 3 × 30 s plank and side plank each session",
+            "Add 10 min hip-flexor and thoracic mobility to every warm-up",
         ]
 
-    if not strengths:
-        strengths.append("Showing commitment to technique improvement through video analysis")
     if not suggestions:
-        suggestions.append("Maintain current technique — focus on match-play consistency")
+        suggestions.append("No faults above threshold — keep repeating this technique under match-like pressure")
     if not drills:
-        drills.append("Continue regular training: minimum 3 sessions per week")
+        drills.append("Maintain 3 quality sessions per week with one filmed for review")
 
     return {
         "strengths":               strengths,
@@ -1251,80 +696,38 @@ def _generate_rule_based_report(metrics: dict, type_: str, faults: List[Dict] = 
 
 
 def extract_raw_frame_metrics(all_landmarks: List[Optional[dict]], action_type: str) -> List[dict]:
-    """
-    Computes per-frame biomechanical angles and coordinates for all detected poses.
-    Outputs match the DB model columns of RawFrameMetric.
-    """
+    """Per-frame joint angles and positions (columns of the RawFrameMetric table)."""
     frame_metrics = []
     for idx, lm in enumerate(all_landmarks):
         if not lm:
             continue
 
-        left_knee = None
-        lh = get_point(lm, LEFT_HIP)
-        lk = get_point(lm, LEFT_KNEE)
-        la = get_point(lm, LEFT_ANKLE)
-        if lh and lk and la:
-            left_knee = calculate_angle(lh, lk, la)
+        def ang(a, b, c):
+            pa, pb, pc = get_point(lm, a), get_point(lm, b), get_point(lm, c)
+            return calculate_angle(pa, pb, pc) if pa and pb and pc else None
 
-        right_knee = None
-        rh = get_point(lm, RIGHT_HIP)
-        rk = get_point(lm, RIGHT_KNEE)
-        ra = get_point(lm, RIGHT_ANKLE)
-        if rh and rk and ra:
-            right_knee = calculate_angle(rh, rk, ra)
-
-        left_elbow = None
-        ls = get_point(lm, LEFT_SHOULDER)
-        le = get_point(lm, LEFT_ELBOW)
-        lw = get_point(lm, LEFT_WRIST)
-        if ls and le and lw:
-            left_elbow = calculate_angle(ls, le, lw)
-
-        right_elbow = None
-        rs = get_point(lm, RIGHT_SHOULDER)
-        re = get_point(lm, RIGHT_ELBOW)
-        rw = get_point(lm, RIGHT_WRIST)
-        if rs and re and rw:
-            right_elbow = calculate_angle(rs, re, rw)
-
-        shoulder_tilt = None
-        if ls and rs:
-            shoulder_tilt = abs(ls[1] - rs[1])
-
-        hip_tilt = None
-        if lh and rh:
-            hip_tilt = abs(lh[1] - rh[1])
+        ls, rs = get_point(lm, LEFT_SHOULDER), get_point(lm, RIGHT_SHOULDER)
+        lh, rh = get_point(lm, LEFT_HIP), get_point(lm, RIGHT_HIP)
+        la, ra = get_point(lm, LEFT_ANKLE), get_point(lm, RIGHT_ANKLE)
+        rw, nose = get_point(lm, RIGHT_WRIST), get_point(lm, NOSE)
 
         spine_offset = None
         if ls and rs and lh and rh:
-            mid_sh_x = (ls[0] + rs[0]) / 2
-            mid_hip_x = (lh[0] + rh[0]) / 2
-            spine_offset = abs(mid_sh_x - mid_hip_x)
-
-        wrist_y = rw[1] if rw else None
-        nose_y = lm.get(NOSE)[1] if lm.get(NOSE) else None
-
-        ankle_spread = None
-        lan = get_point(lm, LEFT_ANKLE)
-        ran = get_point(lm, RIGHT_ANKLE)
-        if lan and ran:
-            ankle_spread = abs(lan[0] - ran[0])
+            spine_offset = round(abs((ls[0] + rs[0]) / 2 - (lh[0] + rh[0]) / 2), 5)
 
         frame_metrics.append({
             "frameIndex": idx,
             "frameType": action_type,
             "landmarks": lm,
-            "leftKneeAngle": left_knee,
-            "rightKneeAngle": right_knee,
-            "leftElbowAngle": left_elbow,
-            "rightElbowAngle": right_elbow,
-            "shoulderTilt": shoulder_tilt,
-            "hipTilt": hip_tilt,
+            "leftKneeAngle": ang(LEFT_HIP, LEFT_KNEE, LEFT_ANKLE),
+            "rightKneeAngle": ang(RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE),
+            "leftElbowAngle": ang(LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST),
+            "rightElbowAngle": ang(RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST),
+            "shoulderTilt": round(abs(ls[1] - rs[1]), 5) if ls and rs else None,
+            "hipTilt": round(abs(lh[1] - rh[1]), 5) if lh and rh else None,
             "spineOffset": spine_offset,
-            "wristY": wrist_y,
-            "noseY": nose_y,
-            "ankleSpread": ankle_spread
+            "wristY": round(rw[1], 5) if rw else None,
+            "noseY": round(nose[1], 5) if nose else None,
+            "ankleSpread": round(abs(la[0] - ra[0]), 5) if la and ra else None,
         })
     return frame_metrics
-
