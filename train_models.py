@@ -11,8 +11,29 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.video_validator import VideoValidatorNet, extract_validation_features
 from utils.action_classifier import ActionLSTM, format_pose_sequence
-from utils.fault_detector import FaultMLP
 from utils.analysis import _get_yolo, extract_frames, analyze_pose_from_video_frames
+
+class FaultMLP(nn.Module):
+    """
+    MLP to predict binary indicators for 5 faults:
+    [poor balance, head movement, stance issue, weak follow-through, poor timing]
+    Input features:
+    [headStabilityVariance, avgHipTilt, avgSpineOffset, rangeOfMotion, wristYDelta, batSwingAngle, shoulderTilt, kneeBendAngle]
+    """
+    def __init__(self, input_dim=8, hidden_dim=32, num_faults=5):
+        super(FaultMLP, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_faults),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
 
 def get_dataset_dir():
     base_dir = os.path.dirname(os.path.abspath(__file__))

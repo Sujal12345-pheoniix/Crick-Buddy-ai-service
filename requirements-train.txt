@@ -1,0 +1,9 @@
+# Extra tools for train_models.py — NOT needed to run the service.
+#   pip install torch==2.3.1+cpu --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt -r requirements-train.txt
+#
+# Re-exporting models/*.onnx needs `onnx`, which requires protobuf>=5 and therefore
+# conflicts with mediapipe — do that in a separate virtual environment:
+#   pip install ultralytics onnx onnxslim "numpy<2"
+#   python -c "from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx', dynamic=True, simplify=True, opset=17)"
+ultralytics>=8.2.0
