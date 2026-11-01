@@ -27,6 +27,8 @@ Thumbs.db
 *.pt
 *.pth
 *.onnx
+# ...except the exported runtime detectors the service ships with
+!models/*.onnx
 
 # Temp files
 temp/

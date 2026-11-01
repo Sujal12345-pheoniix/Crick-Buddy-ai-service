@@ -46,24 +46,14 @@ _mp_pose_c1 = None
 _mp_pose_c2 = None
 
 
-def _load_yolo(env_var: str, default: str):
-    from ultralytics import YOLO
-    weight = os.getenv(env_var, default)
-    if not os.path.isabs(weight):
-        # Resolve against the service folder, not the launch directory, so the
-        # weights are downloaded once and found on every start.
-        service_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        weight = os.path.join(service_dir, weight)
-    return YOLO(weight)
-
-
 def _get_yolo():
-    """Load YOLOv8n once; return None if unavailable (non-fatal)."""
+    """YOLOv8n detector (ONNX Runtime) loaded once; None if unavailable (non-fatal)."""
     global _yolo_model
     if _yolo_model is None:
         try:
-            _yolo_model = _load_yolo("YOLO_WEIGHTS_PATH", "yolov8n.pt")
-            print("[Info] YOLOv8 model loaded")
+            from utils.yolo_onnx import load_model
+            _yolo_model = load_model("YOLO_ONNX_PATH", "yolov8n.onnx")
+            print("[Info] YOLOv8 detector (ONNX) loaded")
         except Exception as e:
             print(f"[Warn] YOLOv8 load failed (will skip crop): {e}")
             _yolo_model = False
@@ -71,12 +61,13 @@ def _get_yolo():
 
 
 def _get_yolo_pose():
-    """YOLOv8n-pose: coarse keypoints for every person in one pass (used to find the bowler)."""
+    """YOLOv8n-pose (ONNX Runtime): coarse keypoints for every person in one pass (used to find the bowler)."""
     global _yolo_pose_model
     if _yolo_pose_model is None:
         try:
-            _yolo_pose_model = _load_yolo("YOLO_POSE_WEIGHTS_PATH", "yolov8n-pose.pt")
-            print("[Info] YOLOv8-pose model loaded")
+            from utils.yolo_onnx import load_model
+            _yolo_pose_model = load_model("YOLO_POSE_ONNX_PATH", "yolov8n-pose.onnx")
+            print("[Info] YOLOv8-pose (ONNX) loaded")
         except Exception as e:
             print(f"[Warn] YOLOv8-pose load failed: {e}")
             _yolo_pose_model = False
@@ -123,7 +114,7 @@ def warmup_models():
         yolo = _get_yolo()
         if yolo:
             dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-            yolo(dummy, verbose=False, conf=0.99, imgsz=320)
+            yolo(dummy, conf=0.99, imgsz=320)
             print("[Info] YOLO warm-up done")
     except Exception as e:
         print(f"[Warn] YOLO warm-up error (non-fatal): {e}")
@@ -131,7 +122,7 @@ def warmup_models():
     try:
         pose_model = _get_yolo_pose()
         if pose_model:
-            pose_model(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False, conf=0.99, imgsz=320)
+            pose_model(np.zeros((480, 640, 3), dtype=np.uint8), conf=0.99, imgsz=320)
     except Exception as e:
         print(f"[Warn] YOLO-pose warm-up error (non-fatal): {e}")
 
@@ -273,11 +264,7 @@ def detect_people(frame: np.ndarray, conf: float = 0.25, imgsz: int = 416) -> Li
     if model is None:
         return []
     try:
-        results = model(frame, verbose=False, conf=conf, classes=[COCO_PERSON], imgsz=imgsz)
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return []
-        people = [([float(v) for v in b.xyxy[0]], float(b.conf[0])) for b in boxes]
+        people = [(d.box, d.conf) for d in model(frame, imgsz=imgsz, conf=conf, classes=[COCO_PERSON])]
         return sorted(people, key=lambda p: (p[0][2] - p[0][0]) * (p[0][3] - p[0][1]), reverse=True)
     except Exception as e:
         print(f"YOLO person detection error: {e}")
@@ -328,12 +315,9 @@ def people_arm_heights(frame: np.ndarray, conf: float = 0.25) -> List[Tuple[List
     if model is None:
         return []
     try:
-        r = model(frame, verbose=False, conf=conf, imgsz=640)[0]
-        if r.keypoints is None or r.boxes is None or len(r.boxes) == 0:
-            return []
-        kps = r.keypoints.data.cpu().numpy()          # (N, 17, 3): x, y, confidence
         out = []
-        for box, k in zip(r.boxes.xyxy.cpu().numpy(), kps):
+        for d in model(frame, imgsz=640, conf=conf):
+            box, k = d.box, d.keypoints                # k: (17, 3) x, y, confidence
             ok = k[:, 2] > 0.3
             if not (ok[5] and ok[6] and ok[11] and ok[12]):
                 continue
@@ -355,10 +339,9 @@ def detect_balls(frame: np.ndarray, conf: float = 0.08) -> List[Tuple[float, flo
     if model is None:
         return []
     try:
-        results = model(frame, verbose=False, conf=conf, classes=[COCO_SPORTS_BALL], imgsz=640)
         out = []
-        for b in results[0].boxes:
-            x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
+        for d in model(frame, imgsz=640, conf=conf, classes=[COCO_SPORTS_BALL]):
+            x1, y1, x2, y2 = d.box
             out.append(((x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1)))
         return out
     except Exception as e:

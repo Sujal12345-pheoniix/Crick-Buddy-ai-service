@@ -55,7 +55,7 @@ BOWLER_SEARCH_RATE = 6            # frames per second scanned with YOLOv8-pose t
 BOWLER_SEARCH_MAX = 160
 DETECT_EVERY = 2                  # re-run YOLO person detection every N frames
 VISIBILITY_MIN = 0.05            # keep MediaPipe's estimate for briefly occluded joints (hands behind the bat)
-CLIP_MAX_SIDE = 800               # analysis frames; larger crops give MediaPipe more pixels on distant players
+CLIP_MAX_SIDE = int(os.getenv("ANALYSIS_MAX_SIDE", "800"))  # larger frames help distant players; lower to save RAM
 SEEK_THRESHOLD = 400              # read sequentially below this many frames — seeking re-decodes from keyframes
 MAX_GAP_FRAMES = 3
 TIME_BUDGET_S = float(os.getenv("ANALYSIS_TIME_BUDGET_SECS", "400"))
@@ -126,20 +126,24 @@ def _video_props(path: str) -> Tuple[float, int]:
     return float(fps), count
 
 
-def _read_at(path: str, indices: List[int]) -> List[Tuple[int, np.ndarray]]:
-    """Frames at the given source indices, decoded in one sequential pass (no seeking)."""
+def _read_at(path: str, indices: List[int]):
+    """
+    Yield (index, frame) at the given source indices, decoded in one sequential pass
+    (no seeking). A generator, so a long scan never holds all its frames in memory.
+    """
     wanted = set(int(i) for i in indices)
     last = max(wanted)
     cap = _open(path)
-    out, idx = [], 0
-    while idx <= last and cap.grab():
-        if idx in wanted:
-            ok, frm = cap.retrieve()
-            if ok and frm is not None:
-                out.append((idx, resize_keep_aspect(frm)))
-        idx += 1
-    cap.release()
-    return out
+    try:
+        idx = 0
+        while idx <= last and cap.grab():
+            if idx in wanted:
+                ok, frm = cap.retrieve()
+                if ok and frm is not None:
+                    yield idx, resize_keep_aspect(frm)
+            idx += 1
+    finally:
+        cap.release()
 
 
 def _read_range(path: str, start: int, count: int, stride: int,

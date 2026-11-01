@@ -1,4 +1,7 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+# Runtime dependencies for the analysis service.
+# No PyTorch/Ultralytics here: the YOLO models run on ONNX Runtime (models/*.onnx),
+# which keeps memory well under a 512 MB hosting limit. Training/export tools are
+# in requirements-train.txt.
 
 # Web framework
 fastapi>=0.110.0
@@ -13,9 +16,11 @@ opencv-python-headless>=4.9.0.80
 # Pinned: mediapipe 0.10.30+ and 1.x removed the legacy
 # mediapipe.solutions.pose API this service uses
 mediapipe==0.10.21
+# mediapipe 0.10.21 breaks with protobuf 5+ ("FieldDescriptor has no attribute label")
+protobuf>=4.25.3,<5
 
-# Object detection (CPU-only torch forced by build.sh)
-ultralytics>=8.2.0
+# Object detection (YOLOv8n / YOLOv8n-pose exported to ONNX)
+onnxruntime>=1.17,<2
 
 # Image processing
 pillow>=10.2.0,<11.0.0

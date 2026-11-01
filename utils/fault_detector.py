@@ -1,54 +1,12 @@
-import torch
-import torch.nn as nn
+"""
+Rule-based technique fault detection for batting, bowling and posture.
+Kept free of PyTorch so the analysis service stays small; the experimental
+FaultMLP network lives in train_models.py.
+"""
+
+from typing import Any, Dict, List
+
 import numpy as np
-import os
-from typing import Dict, List, Any
-
-class FaultMLP(nn.Module):
-    """
-    MLP to predict binary indicators for 5 faults:
-    [poor balance, head movement, stance issue, weak follow-through, poor timing]
-    Input features:
-    [headStabilityVariance, avgHipTilt, avgSpineOffset, rangeOfMotion, wristYDelta, batSwingAngle, shoulderTilt, kneeBendAngle]
-    """
-    def __init__(self, input_dim=8, hidden_dim=32, num_faults=5):
-        super(FaultMLP, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_faults),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        return self.net(x)
-
-def extract_fault_features(metrics: Dict[str, Any], action_type: str) -> np.ndarray:
-    """
-    Standardizes a metric dictionary to a fixed-size 8-dimensional feature vector:
-    1. headStabilityVariance
-    2. avgHipTilt
-    3. avgSpineOffset
-    4. rangeOfMotion
-    5. wristYDelta
-    6. batSwingAngle
-    7. shoulderTilt
-    8. kneeBendAngle
-    """
-    # Use defaults if not present
-    feat = [
-        metrics.get("headStabilityVariance", 0.001) or 0.001,
-        metrics.get("avgHipTilt", 0.02) or 0.02,
-        metrics.get("avgSpineOffset", 0.02) or 0.02,
-        metrics.get("rangeOfMotion", 45.0) or 45.0,
-        metrics.get("wristYDelta", 0.1) or 0.1,
-        metrics.get("batSwingAngle", 45.0) or 45.0,
-        metrics.get("shoulderTilt", 0.02) or 0.02,
-        metrics.get("kneeBendAngle", 150.0) or 150.0
-    ]
-    return np.array([feat], dtype=np.float32)
 
 
 # ─── Runtime rule engine ──────────────────────────────────────────────────────
