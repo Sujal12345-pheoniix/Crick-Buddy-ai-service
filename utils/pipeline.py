@@ -45,20 +45,22 @@ from utils.analysis import (
     resize_keep_aspect,
 )
 from utils.fault_detector import FaultDetector
+from utils.profile import SETTINGS
 
 ENGINE_LOCK = threading.Lock()
 
-WINDOW_SECONDS = float(os.getenv("ANALYSIS_WINDOW_SECONDS", "3.5"))
-ACTION_FPS = {"batting": 25.0, "bowling": 30.0, "posture": 10.0}
-COARSE_SAMPLES = 30
-BOWLER_SEARCH_RATE = 6            # frames per second scanned with YOLOv8-pose to find the bowler
+# Work per clip comes from the analysis profile (utils/profile.py); env vars still override.
+WINDOW_SECONDS = float(os.getenv("ANALYSIS_WINDOW_SECONDS", SETTINGS["window_s"]))
+ACTION_FPS = {"batting": SETTINGS["batting_fps"], "bowling": SETTINGS["bowling_fps"], "posture": 10.0}
+COARSE_SAMPLES = SETTINGS["coarse_samples"]
+BOWLER_SEARCH_RATE = SETTINGS["bowler_rate"]   # frames per second scanned with YOLOv8-pose to find the bowler
 BOWLER_SEARCH_MAX = 160
-DETECT_EVERY = 2                  # re-run YOLO person detection every N frames
+DETECT_EVERY = SETTINGS["detect_every"]        # re-run YOLO person detection every N frames
 VISIBILITY_MIN = 0.05            # keep MediaPipe's estimate for briefly occluded joints (hands behind the bat)
-CLIP_MAX_SIDE = int(os.getenv("ANALYSIS_MAX_SIDE", "800"))  # larger frames help distant players; lower to save RAM
+CLIP_MAX_SIDE = int(os.getenv("ANALYSIS_MAX_SIDE", SETTINGS["max_side"]))  # larger frames help distant players; lower to save RAM
 SEEK_THRESHOLD = 400              # read sequentially below this many frames — seeking re-decodes from keyframes
 MAX_GAP_FRAMES = 3
-TIME_BUDGET_S = float(os.getenv("ANALYSIS_TIME_BUDGET_SECS", "400"))
+TIME_BUDGET_S = float(os.getenv("ANALYSIS_TIME_BUDGET_SECS", "420"))
 NOSE_TO_ANKLE_M = 1.55            # typical adult nose→ankle height, for pace estimation
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"}
 
@@ -227,6 +229,24 @@ def _arm_height(lm: dict) -> float:
     return float(np.nanmax(h)) if np.any(np.isfinite(h)) else float("nan")
 
 
+def _single_subject(path: str, frame_count: int, probes: int = 5) -> bool:
+    """
+    True when one person clearly dominates the clip (a player filming themselves):
+    in most probe frames the largest person is at least 2.5x the area of the next.
+    Lets the engine skip the costly multi-person bowler search.
+    """
+    votes = 0
+    indices = np.linspace(0, frame_count - 1, num=min(probes, frame_count), dtype=int).tolist()
+    for _, frm in _read_at(path, indices):
+        people = detect_people(frm)
+        if len(people) == 1:
+            votes += 1
+        elif len(people) > 1:
+            area = [(b[2] - b[0]) * (b[3] - b[1]) for b, _ in people[:2]]
+            votes += area[0] >= 2.5 * area[1]
+    return votes > probes / 2
+
+
 def _find_bowler(samples: List[Tuple[int, np.ndarray]], deadline: _Deadline,
                  index_rate: float) -> Optional[Tuple[int, List[float], int]]:
     """
@@ -269,10 +289,12 @@ def read_action_clip(path: str, action: str, deadline: _Deadline) -> Clip:
     window_src = int(round(WINDOW_SECONDS * source_fps))
 
     bowler = None   # (source index, box, width of the frame the box was found in)
+    # Match footage needs the multi-person bowler search; a self-filmed clip does not.
+    search_bowler = action == "bowling" and not _single_subject(path, frame_count)
     if frame_count <= window_src * 1.5:
         start, length = 0, frame_count
     else:
-        if action == "bowling":
+        if search_bowler:
             n = int(np.clip(frame_count / source_fps * BOWLER_SEARCH_RATE, 12, BOWLER_SEARCH_MAX))
             idx = np.linspace(0, frame_count - 1, num=n, dtype=int).tolist()
             bowler = _find_bowler(_read_at(path, idx), deadline, source_fps)
@@ -288,7 +310,7 @@ def read_action_clip(path: str, action: str, deadline: _Deadline) -> Clip:
         raise AnalysisError("ERR_INVALID_VIDEO: Could not decode frames from the video.")
 
     seed = None
-    if action == "bowling":
+    if search_bowler:
         if bowler is None:   # short clip: search the window itself
             step = max(1, int(round(eff_fps / BOWLER_SEARCH_RATE)))
             found = _find_bowler([(i, f) for i, f in enumerate(frames[::step])], deadline,
@@ -307,7 +329,8 @@ def read_action_clip(path: str, action: str, deadline: _Deadline) -> Clip:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def track_poses(frames: List[np.ndarray], deadline: _Deadline,
-                seed: Optional[Tuple[int, List[float]]] = None) -> List[Optional[dict]]:
+                seed: Optional[Tuple[int, List[float]]] = None,
+                complexity: Optional[int] = None) -> List[Optional[dict]]:
     """
     Pose for every frame, following one player. Without a seed the largest person
     in the first frame is followed; with a seed (frame index, box) tracking runs
@@ -323,9 +346,10 @@ def track_poses(frames: List[np.ndarray], deadline: _Deadline,
                 box = detect_person_box(frm)
             elif n % DETECT_EVERY == 0:
                 box = match_box(detect_people(frm), box) or box
-            lm = pose_on_frame(frm, box) if box is not None else None
+            kw = {} if complexity is None else {"complexity": complexity}
+            lm = pose_on_frame(frm, box, **kw) if box is not None else None
             if lm is None and seed is None:
-                lm = pose_on_frame(frm, None)
+                lm = pose_on_frame(frm, None, **kw)
             poses[i] = lm
 
     if seed is None:
@@ -513,6 +537,20 @@ def _camera_view(P: np.ndarray, torso: float) -> str:
     return "front-on" if w > 0.6 else "oblique"
 
 
+def _hands(P: np.ndarray) -> np.ndarray:
+    """
+    (T, 2) hand position: mean of the visible wrists. Filmed from behind, the wrists
+    disappear behind the body during the swing, so frames without a wrist fall back
+    to the elbows, which move with the hands and keep the swing trackable.
+    """
+    with np.errstate(all="ignore"):
+        wrists = np.nanmean(np.stack([_pt(P, LEFT_WRIST), _pt(P, RIGHT_WRIST)]), axis=0)
+        elbows = np.nanmean(np.stack([_pt(P, LEFT_ELBOW), _pt(P, RIGHT_ELBOW)]), axis=0)
+    missing = ~np.all(np.isfinite(wrists), axis=1)
+    wrists[missing] = elbows[missing]
+    return wrists
+
+
 def _first_stride(ank_speed: np.ndarray, feet_gap: np.ndarray, torso: float,
                   min_speed: float = 1.2, min_move: float = 0.25) -> Tuple[Optional[int], Optional[int]]:
     """
@@ -587,7 +625,7 @@ def batting_from_poses(poses: List[Optional[dict]], fps: float, batting_style: O
 
     hip_c = _mid(_pt(P, LEFT_HIP), _pt(P, RIGHT_HIP))
     sh_c = _mid(_pt(P, LEFT_SHOULDER), _pt(P, RIGHT_SHOULDER))
-    hands = np.nanmean(np.stack([_pt(P, LEFT_WRIST), _pt(P, RIGHT_WRIST)]), axis=0)
+    hands = _hands(P)
     hand_speed = _speed(hands - hip_c, fps) / torso            # torso-lengths per second
 
     # Camera view decides what can be measured: from front-on/behind, the stride moves
@@ -874,7 +912,7 @@ def analyze_bowling(path: str, bowling_style: Optional[str] = None) -> EngineRes
     deadline = _Deadline(TIME_BUDGET_S)
     with ENGINE_LOCK:
         clip = read_action_clip(path, "bowling", deadline)
-        poses = track_poses(clip.frames, deadline, clip.seed)
+        poses = track_poses(clip.frames, deadline, clip.seed, SETTINGS["bowling_pose_complexity"])
         metrics, faults, release = bowling_from_poses(
             poses, clip.fps, bowling_style,
             ball_speed_fn=lambda rel, P: _estimate_ball_speed(path, clip, rel, P, deadline),

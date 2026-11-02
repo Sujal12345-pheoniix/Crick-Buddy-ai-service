@@ -25,6 +25,10 @@ from typing import Optional, List, Tuple, Dict
 
 import numpy as np
 
+from utils.profile import SETTINGS
+
+POSE_COMPLEXITY = SETTINGS["pose_complexity"]   # 0 = MediaPipe lite (fast profile), 1 = full
+
 # ─── MediaPipe Landmark IDs (BlazePose 33-point model) ───────────────────────
 NOSE = 0
 LEFT_SHOULDER = 11;  RIGHT_SHOULDER = 12
@@ -42,6 +46,7 @@ COCO_BASEBALL_BAT = 34   # closest COCO proxy for a cricket bat
 # ─── Global model singletons (loaded once, reused across ALL requests) ────────
 _yolo_model = None
 _yolo_pose_model = None
+_mp_pose_c0 = None
 _mp_pose_c1 = None
 _mp_pose_c2 = None
 
@@ -74,8 +79,8 @@ def _get_yolo_pose():
     return _yolo_pose_model if _yolo_pose_model else None
 
 
-def _get_mp_pose(complexity: int = 1):
-    global _mp_pose_c1, _mp_pose_c2
+def _get_mp_pose(complexity: int = POSE_COMPLEXITY):
+    global _mp_pose_c0, _mp_pose_c1, _mp_pose_c2
     try:
         import mediapipe.solutions.pose as mp_pose
     except ModuleNotFoundError:
@@ -85,6 +90,16 @@ def _get_mp_pose(complexity: int = 1):
             print(f"[Error] Critical MediaPipe import failed: {e}")
             raise e
 
+    if complexity == 0:
+        if _mp_pose_c0 is None:
+            _mp_pose_c0 = mp_pose.Pose(
+                static_image_mode=True,
+                model_complexity=0,
+                enable_segmentation=False,
+                min_detection_confidence=0.30,
+            )
+            print("[Info] MediaPipe Pose (complexity=0, lite) singleton ready")
+        return _mp_pose_c0
     if complexity == 1:
         if _mp_pose_c1 is None:
             _mp_pose_c1 = mp_pose.Pose(
@@ -127,9 +142,9 @@ def warmup_models():
         print(f"[Warn] YOLO-pose warm-up error (non-fatal): {e}")
 
     try:
-        pose = _get_mp_pose(1)
+        pose = _get_mp_pose()
         pose.process(np.zeros((480, 640, 3), dtype=np.uint8))
-        print("[Info] MediaPipe Pose (c=1) warm-up done")
+        print(f"[Info] MediaPipe Pose (c={POSE_COMPLEXITY}) warm-up done")
     except Exception as e:
         print(f"[Warn] MediaPipe Pose warm-up error (non-fatal): {e}")
 
@@ -316,7 +331,7 @@ def people_arm_heights(frame: np.ndarray, conf: float = 0.25) -> List[Tuple[List
         return []
     try:
         out = []
-        for d in model(frame, imgsz=640, conf=conf):
+        for d in model(frame, imgsz=SETTINGS["bowler_imgsz"], conf=conf):
             box, k = d.box, d.keypoints                # k: (17, 3) x, y, confidence
             ok = k[:, 2] > 0.3
             if not (ok[5] and ok[6] and ok[11] and ok[12]):
@@ -349,7 +364,7 @@ def detect_balls(frame: np.ndarray, conf: float = 0.08) -> List[Tuple[float, flo
         return []
 
 
-def pose_on_frame(frame_bgr: np.ndarray, box=None, complexity: int = 1, pad: float = 0.2) -> Optional[dict]:
+def pose_on_frame(frame_bgr: np.ndarray, box=None, complexity: int = POSE_COMPLEXITY, pad: float = 0.2) -> Optional[dict]:
     """
     MediaPipe pose for one frame. With a person box the crop is padded and the
     landmarks re-projected to full-frame normalised coordinates.
@@ -385,7 +400,7 @@ def pose_on_frame(frame_bgr: np.ndarray, box=None, complexity: int = 1, pad: flo
     return landmarks
 
 
-def _run_mediapipe_on_frame(frame_bgr: np.ndarray, complexity: int = 1) -> Optional[dict]:
+def _run_mediapipe_on_frame(frame_bgr: np.ndarray, complexity: int = POSE_COMPLEXITY) -> Optional[dict]:
     """YOLO crop → MediaPipe on a single frame; falls back to the full frame."""
     frame_bgr = resize_keep_aspect(frame_bgr)
     box = detect_person_box(frame_bgr)
@@ -406,7 +421,7 @@ def analyze_pose_from_image(image_path: str) -> Optional[dict]:
     image = cv2.imread(image_path)
     if image is None:
         return None
-    for complexity in (1, 2):
+    for complexity in (POSE_COMPLEXITY, POSE_COMPLEXITY + 1):
         lm = _run_mediapipe_on_frame(image, complexity=complexity)
         if lm is not None:
             return lm
